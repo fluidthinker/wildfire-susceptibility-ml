@@ -1,0 +1,62 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment files
+.env
+.env.*
+
+# VS Code settings
+.vscode/
+*.code-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Data directories
+/data/raw/*
+/data/interim/*
+/data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Generated outputs
+/outputs/*
+/outputs/figures/*
+/outputs/maps/*
+!outputs/.gitkeep
+!outputs/figures/.gitkeep
+!outputs/maps/.gitkeep
+
+# Large GIS and geospatial artifacts that should not normally be committed
+*.tif
+*.tiff
+*.asc
+*.nc
+*.hdf
+*.h5
+*.img
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.kml
+*.kmz
+
+# Local analysis outputs and scratch files
+*.log
+*.tmp

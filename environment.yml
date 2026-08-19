@@ -1,0 +1,13 @@
+name: wildfire-ml
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - geopandas
+  - pandas
+  - numpy
+  - matplotlib
+  - scikit-learn
+  - rasterio
+  - rioxarray
+  - pyproj
