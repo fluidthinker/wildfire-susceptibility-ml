@@ -85,3 +85,5 @@ plt.show()
 new_mexico_projected.to_file(prepared_boundary_path, layer="new_mexico_boundary", driver="GPKG")
 print(f"Saved prepared boundary to: {prepared_boundary_path}")
 print(f"Saved CRS: {new_mexico_projected.crs}")
+
+# %%
