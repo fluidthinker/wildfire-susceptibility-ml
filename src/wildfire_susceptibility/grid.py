@@ -9,11 +9,26 @@ def create_analysis_grid(
     boundary: gpd.GeoDataFrame,
     cell_size: int = 1000,
 ) -> gpd.GeoDataFrame:
-    """Create full square cells whose centroids fall within a study boundary.
+    """Create a regular square grid within a study-area boundary.
 
-    Candidate cells are aligned to multiples of ``cell_size`` in the boundary
-    CRS. Centroids exactly on the boundary are excluded by the ``within``
-    predicate.
+    Candidate cells are created in the boundary's projected, meter-based CRS
+    and aligned to exact multiples of ``cell_size``. Full cells are retained
+    when their centroids fall strictly within the boundary; cells are not
+    clipped, and centroids on the boundary are excluded.
+
+    Args:
+        boundary: GeoDataFrame containing exactly one valid, non-empty
+            study-area geometry in a projected CRS with meter units.
+        cell_size: Width and height of each square grid cell in meters.
+
+    Returns:
+        GeoDataFrame containing full retained grid cells and deterministic,
+        unique cell IDs. The candidate-cell count is stored in
+        ``GeoDataFrame.attrs["candidate_cell_count"]``.
+
+    Raises:
+        ValueError: If the boundary, CRS, geometry, cell size, generated grid,
+            cell dimensions, cell IDs, or centroid membership is invalid.
     """
     if len(boundary) != 1:
         raise ValueError(
@@ -35,6 +50,8 @@ def create_analysis_grid(
     if not boundary.geometry.is_valid.all():
         raise ValueError("Boundary geometry is invalid.")
 
+    # Snap the extent to cell-size multiples so alignment is deterministic
+    # and compatible across study areas in the same projected CRS.
     min_x, min_y, max_x, max_y = boundary.total_bounds
     x_origins = np.arange(
         np.floor(min_x / cell_size) * cell_size,
@@ -46,6 +63,8 @@ def create_analysis_grid(
         np.ceil(max_y / cell_size) * cell_size,
         cell_size,
     )
+    # Build all bounding-box candidates with vectorized coordinate arrays to
+    # avoid a Python loop over hundreds of thousands of polygons.
     x_grid, y_grid = np.meshgrid(x_origins, y_origins)
     candidate_geometry = shapely.box(
         x_grid.ravel(),
@@ -55,6 +74,8 @@ def create_analysis_grid(
     )
     candidate_count = len(candidate_geometry)
 
+    # Preserve complete, equal-area cells for analysis; the strict ``within``
+    # predicate excludes the rare centroid that lies exactly on the boundary.
     boundary_geometry = boundary.geometry.iloc[0]
     centroid_mask = shapely.within(
         shapely.centroid(candidate_geometry), boundary_geometry
@@ -73,6 +94,8 @@ def create_analysis_grid(
     )
     grid.attrs["candidate_cell_count"] = candidate_count
 
+    # Verify the methodological guarantees after filtering: full valid
+    # squares, stable IDs, and centroids that satisfy the inclusion rule.
     if grid.empty:
         raise ValueError("No grid cells have centroids within the boundary.")
     if grid.crs != boundary.crs:
