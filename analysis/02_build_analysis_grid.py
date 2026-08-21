@@ -31,11 +31,39 @@ print(grid.head())
 
 # %% Visual inspection
 state_name = state.iloc[0]["NAME"]
-fig, ax = plt.subplots(figsize=(8, 8))
-grid.plot(ax=ax, color="lightsteelblue", edgecolor="none", rasterized=True)
-state.boundary.plot(ax=ax, color="black", linewidth=0.8)
-ax.set_title(f"{state_name} 1-km analysis grid")
-ax.set_axis_off()
+
+# Statewide coverage overview
+fig, overview_ax = plt.subplots(figsize=(8, 8))
+grid.plot(
+    ax=overview_ax,
+    facecolor="lightsteelblue",
+    edgecolor="slategray",
+    linewidth=0.05,
+    rasterized=True,
+)
+state.boundary.plot(ax=overview_ax, color="black", linewidth=1.0)
+overview_ax.set_title(f"{state_name} 1-km analysis grid — statewide overview")
+overview_ax.set_axis_off()
+plt.show()
+
+# Spatially contiguous detail near the center of the state
+state_center = state.geometry.iloc[0].centroid
+detail_half_width = 10 * CELL_SIZE_M
+detail_grid = grid.cx[
+    state_center.x - detail_half_width : state_center.x + detail_half_width,
+    state_center.y - detail_half_width : state_center.y + detail_half_width,
+]
+
+fig, detail_ax = plt.subplots(figsize=(8, 8))
+detail_grid.plot(
+    ax=detail_ax,
+    facecolor="none",
+    edgecolor="black",
+    linewidth=0.6,
+)
+detail_ax.set_title(f"{state_name} 1-km grid — central detail")
+detail_ax.set_aspect("equal")
+detail_ax.set_axis_off()
 plt.show()
 
 # %% Save analysis grid
