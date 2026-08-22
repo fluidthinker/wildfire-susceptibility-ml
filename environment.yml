@@ -12,3 +12,7 @@ dependencies:
   - rioxarray
   - pyproj
   - ipykernel
+  - pystac-client
+  - planetary-computer
+  - stackstac
+  - dask
