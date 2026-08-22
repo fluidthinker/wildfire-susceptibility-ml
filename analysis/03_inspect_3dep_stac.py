@@ -143,3 +143,4 @@ print(f"Mean: {float(dem_test_loaded.mean().values):.2f} m")
 # Visual QA/QC of the small elevation window.
 
 dem_test_loaded.squeeze().plot()
+# %%
