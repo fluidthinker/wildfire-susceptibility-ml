@@ -132,6 +132,8 @@ Use concise module-level docstrings that explain the module's responsibility.
 
 ## Comments
 
+## Code comments
+
 Comments should explain **why a decision is being made**, not merely repeat what the code already says.
 
 Good:
@@ -161,20 +163,37 @@ immediately above:
 bounds = boundary.total_bounds
 ```
 
-Add comments particularly when code involves:
+Add explanatory comments particularly when code involves:
 
-* CRS choices
-* units
-* spatial predicates
-* raster resampling
-* zonal aggregation
-* NoData handling
-* categorical encoding
-* temporal assumptions
-* data leakage prevention
-* spatial validation
-* modeling decisions that may not be obvious from syntax alone
+- CRS choices and reprojection
+- units and resolution
+- spatial predicates and geometry assumptions
+- raster resampling
+- zonal aggregation
+- NoData handling
+- categorical encoding
+- temporal assumptions
+- filtering criteria
+- QA/QC checks and why they matter
+- data leakage prevention
+- spatial validation
+- modeling decisions that may not be obvious from syntax alone
+- lazy loading, chunking, or limiting data access
 
+For exploratory scripts in `analysis/`:
+
+- Use `# %%` cells.
+- Add short comments before important code blocks so the workflow can be read like a narrated analysis.
+- Assume the reader is learning the workflow and should be able to understand the purpose of each major step without reverse-engineering the code.
+- Prefer comments that explain the geospatial, scientific, or data-engineering reasoning behind a step.
+- Make important assumptions visible in comments, especially when a change could affect scientific validity or reproducibility.
+
+Avoid:
+
+- comments that merely restate obvious Python syntax
+- excessive line-by-line commenting
+- long essay-like comments when a concise explanation is sufficient
+- comments that describe what the code used to do rather than what the current code does
 ---
 
 ## Geospatial conventions
@@ -315,3 +334,5 @@ Prefer code that makes the scientific and geospatial reasoning easy to understan
 The goal is not merely to make the code run.
 
 The goal is to produce a reusable workflow whose assumptions, spatial decisions, and modeling choices can be understood and defended.
+
+
