@@ -4,7 +4,10 @@
 from pathlib import Path
 
 import geopandas as gpd
+import matplotlib.pyplot as plt
 from pystac_client import Client
+from shapely.errors import ShapelyError
+from shapely.geometry import box, shape
 
 
 # %% Case-study parameters
@@ -102,4 +105,83 @@ for item in items_10m[:QA_ITEM_COUNT]:
     print(f"  Assets: {', '.join(item.assets)}")
 
 
-# %%
+# %% Build 10 m Item footprints for spatial coverage QA/QC
+footprint_records = []
+
+for item in items_10m:
+    item_geometry = None
+
+    # Prefer the STAC geometry because it can describe a more precise footprint
+    # than the rectangular bbox supplied for spatial indexing.
+    if item.geometry is not None:
+        try:
+            candidate_geometry = shape(item.geometry)
+        except (AttributeError, KeyError, TypeError, ValueError, ShapelyError):
+            candidate_geometry = None
+
+        if (
+            candidate_geometry is not None
+            and not candidate_geometry.is_empty
+            and candidate_geometry.is_valid
+        ):
+            item_geometry = candidate_geometry
+
+    if item_geometry is None:
+        if item.bbox is None or len(item.bbox) != 4:
+            raise ValueError(
+                f"10 m Item {item.id!r} has no usable geometry or bbox."
+            )
+        item_geometry = box(*item.bbox)
+
+    footprint_records.append(
+        {
+            "item_id": item.id,
+            "gsd": item.properties.get("gsd"),
+            "datetime": item.datetime,
+            "geometry": item_geometry,
+        }
+    )
+
+item_footprints_10m = gpd.GeoDataFrame(
+    footprint_records,
+    geometry="geometry",
+    crs=STAC_CRS,
+)
+
+if item_footprints_10m.empty:
+    raise ValueError("The 10 m Item footprint GeoDataFrame is empty.")
+if (
+    item_footprints_10m.geometry.isna().any()
+    or item_footprints_10m.geometry.is_empty.any()
+):
+    raise ValueError("10 m Item footprints contain missing or empty geometry.")
+if item_footprints_10m.crs is None or item_footprints_10m.crs.to_epsg() != 4326:
+    raise ValueError("10 m Item footprints must have CRS EPSG:4326.")
+
+print(f"\n10 m footprint features: {len(item_footprints_10m):,}")
+print(f"10 m footprint CRS: {item_footprints_10m.crs}")
+
+
+# %% Plot 10 m Item coverage over New Mexico
+figure, axis = plt.subplots(figsize=(10, 10))
+
+# Draw every tile boundary without fill so gaps, overlap, and edge tiles remain
+# visible against the state outline.
+item_footprints_10m.boundary.plot(
+    ax=axis,
+    color="tab:blue",
+    linewidth=0.8,
+    alpha=0.8,
+)
+boundary_wgs84.boundary.plot(
+    ax=axis,
+    color="black",
+    linewidth=2.0,
+)
+
+axis.set_title("3DEP 10 m STAC Item Coverage — New Mexico")
+axis.set_xlabel("Longitude")
+axis.set_ylabel("Latitude")
+axis.set_aspect("equal")
+figure.tight_layout()
+plt.show()
