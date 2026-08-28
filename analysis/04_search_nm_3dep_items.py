@@ -80,16 +80,23 @@ if not items:
 
 
 # %% Concise metadata QA/QC
+gsd_values = sorted(
+    {item.properties.get("gsd") for item in items},
+    key=lambda value: (value is None, str(value)),
+)
+items_10m = [item for item in items if item.properties.get("gsd") == 10]
+
 print("\n3DEP NEW MEXICO SEARCH")
 print("----------------------")
 print(f"Total Items found: {len(items):,}")
-print(f"Showing first {min(QA_ITEM_COUNT, len(items))} Items:")
+print(f"Distinct GSD values: {gsd_values}")
+print(f"10 m Items found: {len(items_10m):,}")
+print(f"Showing first {min(QA_ITEM_COUNT, len(items_10m))} 10 m Items:")
 
-for item in items[:QA_ITEM_COUNT]:
+for item in items_10m[:QA_ITEM_COUNT]:
     print(f"\nItem ID: {item.id}")
     print(f"  BBOX: {item.bbox}")
     print(f"  Datetime: {item.datetime}")
     print(f"  GSD: {item.properties.get('gsd')}")
     print(f"  proj:code: {item.properties.get('proj:code')}")
     print(f"  Assets: {', '.join(item.assets)}")
-
