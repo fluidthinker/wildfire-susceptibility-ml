@@ -1,10 +1,12 @@
 """Search 3DEP STAC metadata intersecting the New Mexico boundary."""
 
 # %% Imports
+import warnings
 from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from pyproj import network
 from pystac_client import Client
 from shapely.errors import ShapelyError
 from shapely.geometry import box, shape
@@ -14,7 +16,9 @@ from shapely.geometry import box, shape
 PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "3dep-seamless"
 STAC_CRS = "EPSG:4326"
+AREA_CRS = "EPSG:5070"
 QA_ITEM_COUNT = 5
+UNCOVERED_AREA_TOLERANCE_SQ_M = 1.0
 
 repo_root = Path(__file__).resolve().parents[1]
 boundary_path = (
@@ -162,6 +166,54 @@ print(f"\n10 m footprint features: {len(item_footprints_10m):,}")
 print(f"10 m footprint CRS: {item_footprints_10m.crs}")
 
 
+# %% Quantify 10 m Item coverage of New Mexico
+# Preserve the longitude/latitude footprints for STAC visualization and use
+# projected copies only where area measurements in square meters are required.
+# Restrict this reprojection to locally available coordinate operations. This
+# prevents PROJ from attempting a remote datum-grid download during QA/QC.
+proj_network_was_enabled = network.is_network_enabled()
+try:
+    network.set_network_enabled(False)
+    boundary_5070 = boundary_wgs84.to_crs(AREA_CRS)
+    item_footprints_10m_5070 = item_footprints_10m.to_crs(AREA_CRS)
+finally:
+    network.set_network_enabled(proj_network_was_enabled)
+
+coverage_geometry_5070 = item_footprints_10m_5070.geometry.union_all()
+new_mexico_geometry_5070 = boundary_5070.geometry.union_all()
+uncovered_geometry_5070 = new_mexico_geometry_5070.difference(
+    coverage_geometry_5070
+)
+
+new_mexico_area_sq_m = new_mexico_geometry_5070.area
+uncovered_area_sq_m = uncovered_geometry_5070.area
+uncovered_area_sq_km = uncovered_area_sq_m / 1_000_000
+uncovered_percentage = 100 * uncovered_area_sq_m / new_mexico_area_sq_m
+is_fully_covered = uncovered_area_sq_m <= UNCOVERED_AREA_TOLERANCE_SQ_M
+
+print("\n3DEP 10 m COVERAGE QA/QC")
+print("-------------------------")
+print(f"Total 10 m Items: {len(item_footprints_10m):,}")
+print(f"New Mexico fully covered: {is_fully_covered}")
+print(f"Uncovered area: {uncovered_area_sq_km:.9f} km²")
+print(f"Uncovered percentage: {uncovered_percentage:.12f}%")
+
+# A sub-square-meter remainder can arise from coordinate transformation and
+# geometry precision; larger gaps indicate materially incomplete coverage.
+if uncovered_area_sq_m > UNCOVERED_AREA_TOLERANCE_SQ_M:
+    warnings.warn(
+        "10 m 3DEP coverage is incomplete: "
+        f"{uncovered_area_sq_km:.9f} km² "
+        f"({uncovered_percentage:.12f}%) of New Mexico is uncovered.",
+        stacklevel=1,
+    )
+elif uncovered_area_sq_m > 0:
+    print(
+        "Coverage note: the nonzero uncovered area is within the "
+        f"{UNCOVERED_AREA_TOLERANCE_SQ_M:g} m² numerical tolerance."
+    )
+
+
 # %% Plot 10 m Item coverage over New Mexico
 figure, axis = plt.subplots(figsize=(10, 10))
 
@@ -185,3 +237,5 @@ axis.set_ylabel("Latitude")
 axis.set_aspect("equal")
 figure.tight_layout()
 plt.show()
+
+# %%
