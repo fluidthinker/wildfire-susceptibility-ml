@@ -53,6 +53,7 @@ output_path = (
     / "features"
     / "nm_terrain_features_1km.parquet"
 )
+interim_dir = repo_root / "data" / "interim" / "terrain_1km"
 
 
 # %% Read and validate the prepared spatial inputs
@@ -332,15 +333,110 @@ print(f"10 m terrain arrays Dask-backed: {terrain_dask_backed}")
 print(f"1-km aggregate arrays Dask-backed: {aggregate_dask_backed}")
 
 
-# %% Materialize only the compact rectangular 1-km summaries
-# Computing after aggregation avoids creating any multi-billion-pixel local
-# intermediate. Dask can also share common upstream tasks among these outputs.
-aggregated_loaded = aggregated.compute()
+# %% Materialize and checkpoint one compact 1-km feature at a time
+def load_or_compute_aggregate(
+    feature_name: str,
+    aggregate: xr.DataArray,
+) -> np.ndarray:
+    """Load a valid compact checkpoint or compute one aggregate feature.
+
+    Serial feature evaluation bounds peak memory by preventing independent
+    elevation, slope, and aspect branches from running concurrently. This may
+    repeat remote source work, but no statewide 10 m intermediate is persisted.
+
+    Args:
+        feature_name: Name used for the checkpoint column and filename.
+        aggregate: Lazy 637-by-617 aggregate array to compute if needed.
+
+    Returns:
+        Two-dimensional aggregate values in deterministic row-major order.
+
+    Raises:
+        ValueError: If a checkpoint or computed aggregate has the wrong shape,
+            schema, keys, or row count.
+    """
+    checkpoint_path = interim_dir / f"nm_{feature_name}_rectangular_1km.parquet"
+    expected_count = rectangular_rows * rectangular_columns
+    expected_row_indices = np.repeat(
+        np.arange(rectangular_rows, dtype=np.int32), rectangular_columns
+    )
+    expected_column_indices = np.tile(
+        np.arange(rectangular_columns, dtype=np.int32), rectangular_rows
+    )
+
+    if checkpoint_path.exists():
+        checkpoint = pd.read_parquet(checkpoint_path)
+        expected_columns = ["row_index", "column_index", feature_name]
+        if list(checkpoint.columns) != expected_columns:
+            raise ValueError(
+                f"Interim checkpoint has unexpected columns: {checkpoint_path}"
+            )
+        if len(checkpoint) != expected_count:
+            raise ValueError(
+                f"Interim checkpoint has an unexpected row count: {checkpoint_path}"
+            )
+        if not (
+            np.array_equal(checkpoint["row_index"], expected_row_indices)
+            and np.array_equal(
+                checkpoint["column_index"], expected_column_indices
+            )
+        ):
+            raise ValueError(
+                f"Interim checkpoint keys are incomplete or unordered: {checkpoint_path}"
+            )
+        print(f"Loaded completed checkpoint: {checkpoint_path}")
+        return checkpoint[feature_name].to_numpy().reshape(
+            rectangular_rows, rectangular_columns
+        )
+
+    print(f"Computing aggregate feature with bounded scheduler: {feature_name}")
+    # A single-threaded local scheduler processes one expensive mosaic task at
+    # a time. This reduces throughput but prevents many 46-Item chunk mosaics
+    # and terrain branches from occupying memory concurrently.
+    with dask.config.set(scheduler="single-threaded"):
+        computed = aggregate.compute().to_numpy()
+    if computed.shape != (rectangular_rows, rectangular_columns):
+        raise ValueError(
+            f"Computed {feature_name} has unexpected shape {computed.shape}."
+        )
+
+    checkpoint = pd.DataFrame(
+        {
+            "row_index": expected_row_indices,
+            "column_index": expected_column_indices,
+            feature_name: computed.ravel(),
+        }
+    )
+    if len(checkpoint) != expected_count or checkpoint.duplicated(
+        ["row_index", "column_index"]
+    ).any():
+        raise ValueError(f"Computed {feature_name} checkpoint keys are not unique.")
+
+    interim_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint.to_parquet(checkpoint_path, index=False)
+    print(f"Saved completed checkpoint: {checkpoint_path}")
+    return computed
+
+
+# Avoid one Dataset.compute(): its six active statewide branches caused the
+# previous memory failure. Each completed 1-km result is only 393,029 values,
+# so it is safe to retain after its independent computation and checkpoint.
+computed_aggregates = {
+    feature_name: load_or_compute_aggregate(feature_name, aggregated[feature_name])
+    for feature_name in (
+        "elevation_mean",
+        "elevation_std",
+        "slope_mean",
+        "slope_std",
+        "aspect_sin_mean",
+        "aspect_cos_mean",
+    )
+}
 
 
 # %% Map each retained cell deterministically to one aggregated block
-aggregate_x = aggregated_loaded.x.to_numpy()
-aggregate_y = aggregated_loaded.y.to_numpy()
+aggregate_x = aggregated.x.to_numpy()
+aggregate_y = aggregated.y.to_numpy()
 centroids = analysis_grid.geometry.centroid
 column_indices = np.rint(
     (centroids.x.to_numpy() - (grid_bounds[0] + ANALYSIS_CELL_SIZE_M / 2))
@@ -376,7 +472,7 @@ feature_columns = [
 ]
 terrain_features = pd.DataFrame({"cell_id": analysis_grid["cell_id"].to_numpy()})
 for feature_name in feature_columns:
-    terrain_features[feature_name] = aggregated_loaded[feature_name].to_numpy()[
+    terrain_features[feature_name] = computed_aggregates[feature_name][
         row_indices, column_indices
     ]
 
