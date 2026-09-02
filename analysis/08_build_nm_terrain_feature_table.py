@@ -43,9 +43,6 @@ MOSAIC_SPLIT_EVERY = 2
 ALIGNMENT_TOLERANCE_M = 1e-6
 COMPONENT_TOLERANCE = 1e-6
 
-# These central batches test one horizontal and one vertical shared edge. This
-# task intentionally stops after them rather than processing all 1,024 batches.
-TEST_BATCH_STARTS = ((300, 300), (300, 320), (320, 300))
 FEATURE_COLUMNS = [
     "elevation_mean", "elevation_std", "slope_mean", "slope_std",
     "aspect_sin_mean", "aspect_cos_mean", "aspect_strength",
@@ -59,6 +56,7 @@ repo_root = Path(__file__).resolve().parents[1]
 boundary_path = repo_root / "data" / "processed" / "boundaries" / "nm_boundary.gpkg"
 grid_path = repo_root / "data" / "processed" / "grids" / "nm_analysis_grid_1km.gpkg"
 checkpoint_dir = repo_root / "data" / "interim" / "terrain_1km" / "batches"
+output_path = repo_root / "data" / "processed" / "features" / "nm_terrain_features_1km.parquet"
 
 
 # %% Batch helpers
@@ -224,8 +222,6 @@ def _process_batch(batch: dict, selected_items: list, grid_bounds: tuple) -> tup
         except (OSError, ValueError) as error:
             print(f"Invalid checkpoint will be recomputed: {checkpoint_path}\n{error}")
         else:
-            print(f"Skipped valid checkpoint: {checkpoint_path}")
-            _print_batch_qa(checkpoint, batch)
             return checkpoint, True
 
     started_at = perf_counter()
@@ -290,12 +286,8 @@ def _process_batch(batch: dict, selected_items: list, grid_bounds: tuple) -> tup
 
     memory_info = psutil.Process().memory_info()
     peak_bytes = getattr(memory_info, "peak_wset", memory_info.rss)
-    print(f"Completed batch: {batch_id}")
-    print(f"Interior / expanded terrain dimensions: {interior_shape} / {expanded_shape}")
-    print(f"Elapsed time: {perf_counter() - started_at:.1f} seconds")
-    print(f"Process peak memory: {peak_bytes / 1024**3:.2f} GiB")
-    print(f"Saved checkpoint: {checkpoint_path}")
-    _print_batch_qa(checkpoint, batch)
+    checkpoint.attrs["elapsed_seconds"] = perf_counter() - started_at
+    checkpoint.attrs["peak_memory_gib"] = peak_bytes / 1024**3
 
     # Release the complete local graph before another batch is constructed.
     del loaded, aggregates, coarseners, inputs, interiors, aspect_cos, aspect_sin
@@ -343,51 +335,190 @@ if sorted({item.properties.get("proj:code") for item in selected_items}, key=str
     raise ValueError("Qualifying Items have an unexpected source CRS.")
 
 
-# %% Run only the approved three-batch test
-test_batches = [
+# %% Enumerate and inventory every deterministic statewide batch
+all_batches = [
     _batch_spec(row, column, rectangular_rows, rectangular_columns, grid_bounds)
-    for row, column in TEST_BATCH_STARTS
+    for row in range(0, rectangular_rows, BATCH_SIZE_BLOCKS)
+    for column in range(0, rectangular_columns, BATCH_SIZE_BLOCKS)
 ]
-print("SPATIAL-BATCH TEST")
-print("------------------")
-print(f"Global qualifying Items: {len(selected_items):,}")
-print(f"Test batches: {[batch['batch_id'] for batch in test_batches]}")
-print(f"Complete batch size: {BATCH_SIZE_BLOCKS} x {BATCH_SIZE_BLOCKS} blocks")
+valid_checkpoint_ids = set()
+for batch in all_batches:
+    checkpoint_path = checkpoint_dir / f"{batch['batch_id']}.parquet"
+    if not checkpoint_path.exists():
+        continue
+    try:
+        existing_checkpoint = pd.read_parquet(checkpoint_path)
+        _validate_checkpoint(existing_checkpoint, batch)
+    except (OSError, ValueError):
+        continue
+    valid_checkpoint_ids.add(batch["batch_id"])
+
+print("STATEWIDE SPATIAL-BATCH PLAN")
+print("----------------------------")
+print(f"Rectangular aggregate dimensions: {rectangular_rows} x {rectangular_columns}")
+print(f"Total rectangular blocks: {rectangular_rows * rectangular_columns:,}")
+print(f"Full batch size: {BATCH_SIZE_BLOCKS} x {BATCH_SIZE_BLOCKS} blocks")
+print(f"Total batches: {len(all_batches):,}")
+print(f"Existing valid checkpoints: {len(valid_checkpoint_ids):,}")
+print(f"Batches requiring computation: {len(all_batches) - len(valid_checkpoint_ids):,}")
 print(f"Mosaic split_every: {MOSAIC_SPLIT_EVERY}")
 
-test_checkpoints = []
-skipped_batches = []
-for batch in test_batches:
-    checkpoint, skipped = _process_batch(batch, selected_items, grid_bounds)
-    test_checkpoints.append(checkpoint)
-    if skipped:
-        skipped_batches.append(batch["batch_id"])
+
+# %% Process or safely reuse every batch without retaining raster graphs
+run_started_at = perf_counter()
+checkpoint_tables = []
+reused_count = 0
+computed_count = 0
+last_completed_batch = None
+for batch_number, batch in enumerate(all_batches, start=1):
+    batch_started_at = perf_counter()
+    checkpoint, reused = _process_batch(batch, selected_items, grid_bounds)
+    checkpoint_tables.append(checkpoint)
+    last_completed_batch = batch["batch_id"]
+    if reused:
+        reused_count += 1
+        outcome = "reused"
+    else:
+        computed_count += 1
+        outcome = "computed"
+
+    memory_info = psutil.Process().memory_info()
+    peak_bytes = getattr(memory_info, "peak_wset", memory_info.rss)
+    print(
+        f"[{batch_number:03d}/{len(all_batches):03d}] {batch['batch_id']} "
+        f"{outcome}; Items={checkpoint['selected_item_count'].iloc[0]}; "
+        f"rows={len(checkpoint)}; elapsed={perf_counter() - batch_started_at:.1f}s; "
+        f"RSS={memory_info.rss / 1024**3:.2f} GiB; "
+        f"peak={peak_bytes / 1024**3:.2f} GiB"
+    )
 
 
-# %% Validate shared boundaries and combined coverage
-combined_test = pd.concat(test_checkpoints, ignore_index=True)
-expected_test_count = sum(int(batch["block_rows"]) * int(batch["block_columns"]) for batch in test_batches)
-duplicate_test_blocks = int(combined_test.duplicated(["row_index", "column_index"]).sum())
-if len(combined_test) != expected_test_count or duplicate_test_blocks:
-    raise ValueError("Test checkpoints contain duplicate or missing blocks.")
-west, east, south = test_batches
-if west["column_stop"] != east["column_start"] or west["row_stop"] != south["row_start"]:
-    raise ValueError("Test batch index ranges are not contiguous.")
-west_x = combined_test.loc[combined_test["batch_id"] == west["batch_id"], "x_center"].max()
-east_x = combined_test.loc[combined_test["batch_id"] == east["batch_id"], "x_center"].min()
-north_y = combined_test.loc[combined_test["batch_id"] == west["batch_id"], "y_center"].min()
-south_y = combined_test.loc[combined_test["batch_id"] == south["batch_id"], "y_center"].max()
-if not (np.isclose(east_x - west_x, 1_000) and np.isclose(north_y - south_y, 1_000)):
-    raise ValueError("Test block centers are discontinuous across a batch edge.")
+# %% Combine checkpoints and prove complete rectangular coverage
+rectangular_features = pd.concat(checkpoint_tables, ignore_index=True)
+expected_rectangular_count = rectangular_rows * rectangular_columns
+duplicate_block_count = int(
+    rectangular_features.duplicated(["row_index", "column_index"]).sum()
+)
+expected_keys = pd.MultiIndex.from_product(
+    [range(rectangular_rows), range(rectangular_columns)],
+    names=["row_index", "column_index"],
+)
+actual_keys = pd.MultiIndex.from_frame(
+    rectangular_features[["row_index", "column_index"]]
+)
+missing_block_count = len(expected_keys.difference(actual_keys))
+extra_block_count = len(actual_keys.difference(expected_keys))
+if (
+    len(rectangular_features) != expected_rectangular_count
+    or duplicate_block_count
+    or missing_block_count
+    or extra_block_count
+):
+    raise ValueError("Combined checkpoints do not exactly cover the rectangular grid.")
 
-print("\nADJACENT-BATCH QA")
-print("-----------------")
-print(f"Combined expected / actual blocks: {expected_test_count:,} / {len(combined_test):,}")
-print(f"Duplicate tested block keys: {duplicate_test_blocks:,}")
-print("Missing tested block keys: 0")
-print("Horizontal / vertical center continuity: 1,000 m / 1,000 m")
-print("Every batch used and removed its own one-pixel terrain-support halo.")
-print(f"Valid checkpoints skipped during this run: {skipped_batches}")
-print("The script intentionally stops after the three-batch validation set.")
+print("\nRECTANGULAR CHECKPOINT QA")
+print("-------------------------")
+print(f"Expected / actual rows: {expected_rectangular_count:,} / {len(rectangular_features):,}")
+print(f"Duplicate block keys: {duplicate_block_count:,}")
+print(f"Missing block keys: {missing_block_count:,}")
+print(f"Extra block keys: {extra_block_count:,}")
+
+
+# %% Map authoritative retained cells to exactly one rectangular block
+centroids = analysis_grid.geometry.centroid
+retained_mapping = pd.DataFrame(
+    {
+        "cell_id": analysis_grid["cell_id"].to_numpy(),
+        "row_index": np.rint(
+            ((grid_bounds[3] - ANALYSIS_CELL_SIZE_M / 2) - centroids.y.to_numpy())
+            / ANALYSIS_CELL_SIZE_M
+        ).astype(np.int32),
+        "column_index": np.rint(
+            (centroids.x.to_numpy() - (grid_bounds[0] + ANALYSIS_CELL_SIZE_M / 2))
+            / ANALYSIS_CELL_SIZE_M
+        ).astype(np.int32),
+    }
+)
+if retained_mapping.duplicated(["row_index", "column_index"]).any():
+    raise ValueError("Multiple retained cells map to one aggregate block.")
+
+terrain_features = retained_mapping.merge(
+    rectangular_features[["row_index", "column_index", *FEATURE_COLUMNS]],
+    on=["row_index", "column_index"],
+    how="left",
+    validate="one_to_one",
+    indicator=True,
+)
+if not terrain_features["_merge"].eq("both").all():
+    raise ValueError("At least one retained cell is missing an aggregate block.")
+terrain_features = (
+    terrain_features[["cell_id", *FEATURE_COLUMNS]]
+    .sort_values("cell_id")
+    .reset_index(drop=True)
+)
+if len(terrain_features) != EXPECTED_RETAINED_CELL_COUNT:
+    raise ValueError("Final retained terrain table has an unexpected row count.")
+if terrain_features["cell_id"].nunique() != EXPECTED_RETAINED_CELL_COUNT:
+    raise ValueError("Final retained terrain table has missing or duplicate cell IDs.")
+
+
+# %% Validate and report final numeric features without filling missing values
+_validate_feature_values(terrain_features, "final terrain table")
+if terrain_features["elevation_mean"].notna().any() and not np.isfinite(
+    terrain_features.loc[terrain_features["elevation_mean"].notna(), "elevation_mean"]
+).all():
+    raise ValueError("Valid final elevation means contain a non-finite value.")
+
+print("\nFINAL TERRAIN FEATURE QA/QC")
+print("---------------------------")
+for feature_name in FEATURE_COLUMNS:
+    values = terrain_features[feature_name]
+    valid_values = values.dropna()
+    print(f"{feature_name}:")
+    print(f"  valid count: {len(valid_values):,}")
+    print(f"  missing count: {values.isna().sum():,}")
+    print(f"  minimum: {valid_values.min():.6f}")
+    print(f"  maximum: {valid_values.max():.6f}")
+    print(f"  mean: {valid_values.mean():.6f}")
+    print(f"  standard deviation: {valid_values.std(ddof=0):.6f}")
+
+cells_with_missing = int(terrain_features[FEATURE_COLUMNS].isna().any(axis=1).sum())
+missing_aspect = int(
+    terrain_features[["aspect_sin_mean", "aspect_cos_mean"]].isna().all(axis=1).sum()
+)
+print(f"Cells with any missing terrain feature: {cells_with_missing:,}")
+print(f"Cells with undefined/missing aspect summaries: {missing_aspect:,}")
+print(f"Total final rows: {len(terrain_features):,}")
+print(f"Unique cell_id count: {terrain_features['cell_id'].nunique():,}")
+print(f"Duplicate cell_id count: {terrain_features['cell_id'].duplicated().sum():,}")
+print("\nFirst five final rows:")
+print(terrain_features.head().to_string(index=False))
+
+
+# %% Write and independently verify the final compact feature table
+output_path.parent.mkdir(parents=True, exist_ok=True)
+terrain_features.to_parquet(output_path, index=False)
+written_features = pd.read_parquet(output_path)
+if list(written_features.columns) != ["cell_id", *FEATURE_COLUMNS]:
+    raise ValueError("Written terrain Parquet has an unexpected schema.")
+if len(written_features) != EXPECTED_RETAINED_CELL_COUNT:
+    raise ValueError("Written terrain Parquet has an unexpected row count.")
+if written_features["cell_id"].nunique() != EXPECTED_RETAINED_CELL_COUNT:
+    raise ValueError("Written terrain Parquet has duplicate or missing cell IDs.")
+
+run_elapsed_seconds = perf_counter() - run_started_at
+process_memory = psutil.Process().memory_info()
+process_peak_bytes = getattr(process_memory, "peak_wset", process_memory.rss)
+print("\nSTATEWIDE WORKFLOW COMPLETE")
+print("---------------------------")
+print(f"Total batches: {len(all_batches):,}")
+print(f"Newly computed checkpoints: {computed_count:,}")
+print(f"Reused checkpoints: {reused_count:,}")
+print(f"Last completed batch: {last_completed_batch}")
+print(f"Total execution time: {run_elapsed_seconds / 60:.2f} minutes")
+print(f"Process peak memory: {process_peak_bytes / 1024**3:.2f} GiB")
+print(f"Final output: {output_path}")
+print(f"Final file size: {output_path.stat().st_size / 1024**2:.2f} MiB")
+print(f"Final rows / unique cell IDs: {len(written_features):,} / {written_features['cell_id'].nunique():,}")
 
 # %%
