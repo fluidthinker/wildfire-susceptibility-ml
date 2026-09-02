@@ -335,96 +335,7 @@ if sorted({item.properties.get("proj:code") for item in selected_items}, key=str
     raise ValueError("Qualifying Items have an unexpected source CRS.")
 
 
-# %% Enumerate and inventory every deterministic statewide batch
-all_batches = [
-    _batch_spec(row, column, rectangular_rows, rectangular_columns, grid_bounds)
-    for row in range(0, rectangular_rows, BATCH_SIZE_BLOCKS)
-    for column in range(0, rectangular_columns, BATCH_SIZE_BLOCKS)
-]
-valid_checkpoint_ids = set()
-for batch in all_batches:
-    checkpoint_path = checkpoint_dir / f"{batch['batch_id']}.parquet"
-    if not checkpoint_path.exists():
-        continue
-    try:
-        existing_checkpoint = pd.read_parquet(checkpoint_path)
-        _validate_checkpoint(existing_checkpoint, batch)
-    except (OSError, ValueError):
-        continue
-    valid_checkpoint_ids.add(batch["batch_id"])
-
-print("STATEWIDE SPATIAL-BATCH PLAN")
-print("----------------------------")
-print(f"Rectangular aggregate dimensions: {rectangular_rows} x {rectangular_columns}")
-print(f"Total rectangular blocks: {rectangular_rows * rectangular_columns:,}")
-print(f"Full batch size: {BATCH_SIZE_BLOCKS} x {BATCH_SIZE_BLOCKS} blocks")
-print(f"Total batches: {len(all_batches):,}")
-print(f"Existing valid checkpoints: {len(valid_checkpoint_ids):,}")
-print(f"Batches requiring computation: {len(all_batches) - len(valid_checkpoint_ids):,}")
-print(f"Mosaic split_every: {MOSAIC_SPLIT_EVERY}")
-
-
-# %% Process or safely reuse every batch without retaining raster graphs
-run_started_at = perf_counter()
-checkpoint_tables = []
-reused_count = 0
-computed_count = 0
-last_completed_batch = None
-for batch_number, batch in enumerate(all_batches, start=1):
-    batch_started_at = perf_counter()
-    checkpoint, reused = _process_batch(batch, selected_items, grid_bounds)
-    checkpoint_tables.append(checkpoint)
-    last_completed_batch = batch["batch_id"]
-    if reused:
-        reused_count += 1
-        outcome = "reused"
-    else:
-        computed_count += 1
-        outcome = "computed"
-
-    memory_info = psutil.Process().memory_info()
-    peak_bytes = getattr(memory_info, "peak_wset", memory_info.rss)
-    print(
-        f"[{batch_number:03d}/{len(all_batches):03d}] {batch['batch_id']} "
-        f"{outcome}; Items={checkpoint['selected_item_count'].iloc[0]}; "
-        f"rows={len(checkpoint)}; elapsed={perf_counter() - batch_started_at:.1f}s; "
-        f"RSS={memory_info.rss / 1024**3:.2f} GiB; "
-        f"peak={peak_bytes / 1024**3:.2f} GiB"
-    )
-
-
-# %% Combine checkpoints and prove complete rectangular coverage
-rectangular_features = pd.concat(checkpoint_tables, ignore_index=True)
-expected_rectangular_count = rectangular_rows * rectangular_columns
-duplicate_block_count = int(
-    rectangular_features.duplicated(["row_index", "column_index"]).sum()
-)
-expected_keys = pd.MultiIndex.from_product(
-    [range(rectangular_rows), range(rectangular_columns)],
-    names=["row_index", "column_index"],
-)
-actual_keys = pd.MultiIndex.from_frame(
-    rectangular_features[["row_index", "column_index"]]
-)
-missing_block_count = len(expected_keys.difference(actual_keys))
-extra_block_count = len(actual_keys.difference(expected_keys))
-if (
-    len(rectangular_features) != expected_rectangular_count
-    or duplicate_block_count
-    or missing_block_count
-    or extra_block_count
-):
-    raise ValueError("Combined checkpoints do not exactly cover the rectangular grid.")
-
-print("\nRECTANGULAR CHECKPOINT QA")
-print("-------------------------")
-print(f"Expected / actual rows: {expected_rectangular_count:,} / {len(rectangular_features):,}")
-print(f"Duplicate block keys: {duplicate_block_count:,}")
-print(f"Missing block keys: {missing_block_count:,}")
-print(f"Extra block keys: {extra_block_count:,}")
-
-
-# %% Map authoritative retained cells to exactly one rectangular block
+# %% Map authoritative retained cells to aggregate-grid indices
 centroids = analysis_grid.geometry.centroid
 retained_mapping = pd.DataFrame(
     {
@@ -441,7 +352,129 @@ retained_mapping = pd.DataFrame(
 )
 if retained_mapping.duplicated(["row_index", "column_index"]).any():
     raise ValueError("Multiple retained cells map to one aggregate block.")
+if not (
+    retained_mapping["row_index"].between(0, rectangular_rows - 1).all()
+    and retained_mapping["column_index"].between(0, rectangular_columns - 1).all()
+):
+    raise ValueError("A retained cell maps outside the rectangular aggregate grid.")
 
+retained_block_mask = np.zeros(
+    (rectangular_rows, rectangular_columns), dtype=bool
+)
+retained_block_mask[
+    retained_mapping["row_index"], retained_mapping["column_index"]
+] = True
+
+
+# %% Enumerate every batch, then retain only those serving analysis cells
+all_batches = [
+    _batch_spec(row, column, rectangular_rows, rectangular_columns, grid_bounds)
+    for row in range(0, rectangular_rows, BATCH_SIZE_BLOCKS)
+    for column in range(0, rectangular_columns, BATCH_SIZE_BLOCKS)
+]
+analysis_batches = [
+    batch
+    for batch in all_batches
+    if retained_block_mask[
+        batch["row_start"] : batch["row_stop"],
+        batch["column_start"] : batch["column_stop"],
+    ].any()
+]
+empty_batch_count = len(all_batches) - len(analysis_batches)
+valid_checkpoint_ids = set()
+for batch in analysis_batches:
+    checkpoint_path = checkpoint_dir / f"{batch['batch_id']}.parquet"
+    if not checkpoint_path.exists():
+        continue
+    try:
+        existing_checkpoint = pd.read_parquet(checkpoint_path)
+        _validate_checkpoint(existing_checkpoint, batch)
+    except (OSError, ValueError):
+        continue
+    valid_checkpoint_ids.add(batch["batch_id"])
+
+print("STATEWIDE SPATIAL-BATCH PLAN")
+print("----------------------------")
+print(f"Rectangular aggregate dimensions: {rectangular_rows} x {rectangular_columns}")
+print(f"Total rectangular blocks: {rectangular_rows * rectangular_columns:,}")
+print(f"Full batch size: {BATCH_SIZE_BLOCKS} x {BATCH_SIZE_BLOCKS} blocks")
+print(f"Total rectangular batches: {len(all_batches):,}")
+print(f"Batches containing retained cells: {len(analysis_batches):,}")
+print(f"Intentionally skipped non-analysis batches: {empty_batch_count:,}")
+print(f"Valid checkpoints for analysis batches: {len(valid_checkpoint_ids):,}")
+print(
+    "Analysis batches requiring computation: "
+    f"{len(analysis_batches) - len(valid_checkpoint_ids):,}"
+)
+print(f"Mosaic split_every: {MOSAIC_SPLIT_EVERY}")
+
+
+# %% Process or safely reuse every batch without retaining raster graphs
+run_started_at = perf_counter()
+checkpoint_tables = []
+reused_count = 0
+computed_count = 0
+last_completed_batch = None
+for batch_number, batch in enumerate(analysis_batches, start=1):
+    batch_started_at = perf_counter()
+    checkpoint, reused = _process_batch(batch, selected_items, grid_bounds)
+    checkpoint_tables.append(checkpoint)
+    last_completed_batch = batch["batch_id"]
+    if reused:
+        reused_count += 1
+        outcome = "reused"
+    else:
+        computed_count += 1
+        outcome = "computed"
+
+    memory_info = psutil.Process().memory_info()
+    peak_bytes = getattr(memory_info, "peak_wset", memory_info.rss)
+    print(
+        f"[{batch_number:03d}/{len(analysis_batches):03d}] {batch['batch_id']} "
+        f"{outcome}; Items={checkpoint['selected_item_count'].iloc[0]}; "
+        f"rows={len(checkpoint)}; elapsed={perf_counter() - batch_started_at:.1f}s; "
+        f"RSS={memory_info.rss / 1024**3:.2f} GiB; "
+        f"peak={peak_bytes / 1024**3:.2f} GiB"
+    )
+
+
+# %% Combine checkpoints and prove complete analysis-batch coverage
+rectangular_features = pd.concat(checkpoint_tables, ignore_index=True)
+expected_batch_keys = pd.MultiIndex.from_tuples(
+    [
+        (row_index, column_index)
+        for batch in analysis_batches
+        for row_index in range(batch["row_start"], batch["row_stop"])
+        for column_index in range(batch["column_start"], batch["column_stop"])
+    ],
+    names=["row_index", "column_index"],
+)
+expected_rectangular_count = len(expected_batch_keys)
+duplicate_block_count = int(
+    rectangular_features.duplicated(["row_index", "column_index"]).sum()
+)
+actual_keys = pd.MultiIndex.from_frame(
+    rectangular_features[["row_index", "column_index"]]
+)
+missing_block_count = len(expected_batch_keys.difference(actual_keys))
+extra_block_count = len(actual_keys.difference(expected_batch_keys))
+if (
+    len(rectangular_features) != expected_rectangular_count
+    or duplicate_block_count
+    or missing_block_count
+    or extra_block_count
+):
+    raise ValueError("Combined checkpoints do not exactly cover the analysis batches.")
+
+print("\nANALYSIS-BATCH CHECKPOINT QA")
+print("----------------------------")
+print(f"Expected / actual rows: {expected_rectangular_count:,} / {len(rectangular_features):,}")
+print(f"Duplicate block keys: {duplicate_block_count:,}")
+print(f"Missing block keys: {missing_block_count:,}")
+print(f"Extra block keys: {extra_block_count:,}")
+
+
+# %% Attach analysis-batch aggregates to authoritative retained cells
 terrain_features = retained_mapping.merge(
     rectangular_features[["row_index", "column_index", *FEATURE_COLUMNS]],
     on=["row_index", "column_index"],
@@ -511,7 +544,9 @@ process_memory = psutil.Process().memory_info()
 process_peak_bytes = getattr(process_memory, "peak_wset", process_memory.rss)
 print("\nSTATEWIDE WORKFLOW COMPLETE")
 print("---------------------------")
-print(f"Total batches: {len(all_batches):,}")
+print(f"Total rectangular batches: {len(all_batches):,}")
+print(f"Processed analysis batches: {len(analysis_batches):,}")
+print(f"Intentionally skipped non-analysis batches: {empty_batch_count:,}")
 print(f"Newly computed checkpoints: {computed_count:,}")
 print(f"Reused checkpoints: {reused_count:,}")
 print(f"Last completed batch: {last_completed_batch}")
