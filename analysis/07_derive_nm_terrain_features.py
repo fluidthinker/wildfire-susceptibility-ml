@@ -2,19 +2,21 @@
 
 # %% Imports
 import math
+import inspect
+from importlib.metadata import version
 from pathlib import Path
 
 import dask
-import dask.array as da
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import planetary_computer as pc
 import rioxarray  # noqa: F401  # Register the xarray ``.rio`` CRS accessor.
-import xarray as xr
 from pystac_client import Client
 from rasterio.enums import Resampling
 import stackstac
+from xrspatial import aspect as xrspatial_aspect
+from xrspatial import slope as xrspatial_slope
 
 
 # %% Case-study parameters
@@ -31,9 +33,9 @@ CHUNK_BOUNDARY_QA_HALF_WIDTH_PIXELS = 256
 
 # This OUTER halo supplies the 3x3 neighborhood at the edge of every retained
 # 1-km cell. It is part of the statewide processing extent and is distinct from
-# the temporary INTERNAL overlap exchanged between Dask chunks below.
+# the INTERNAL one-pixel overlap that xarray-spatial exchanges between Dask
+# chunks while applying its 3x3 terrain operation.
 TERRAIN_HALO_M = TARGET_RESOLUTION_M
-INTERNAL_OVERLAP_PIXELS = 1
 
 repo_root = Path(__file__).resolve().parents[1]
 boundary_path = (
@@ -42,112 +44,6 @@ boundary_path = (
 grid_path = (
     repo_root / "data" / "processed" / "grids" / "nm_analysis_grid_1km.gpkg"
 )
-
-
-# %% Terrain finite-difference functions
-def horn_terrain_block(
-    elevation: np.ndarray,
-    cell_size: float,
-    derivative_name: str,
-) -> np.ndarray:
-    """Calculate one Horn terrain derivative for an overlapped elevation block.
-
-    The standard Horn (1981) 3x3 weighted finite difference estimates the
-    eastward and northward elevation gradients. Aspect is the downslope azimuth
-    measured clockwise from north. A missing neighbor invalidates the center
-    result, and flat pixels receive NaN aspect because direction is undefined.
-
-    Args:
-        elevation: Two-dimensional elevation block, including any Dask overlap.
-        cell_size: Square raster-cell size in projected coordinate units.
-        derivative_name: Terrain derivative to return: ``"slope"`` or
-            ``"aspect"``.
-
-    Returns:
-        Array with the requested terrain derivative in degrees and the same
-        shape as ``elevation``. Its outermost row and column are NaN.
-
-    Raises:
-        ValueError: If the input or requested output is invalid.
-    """
-    if elevation.ndim != 2:
-        raise ValueError("Horn terrain calculation requires a 2D elevation array.")
-    if cell_size <= 0:
-        raise ValueError("Cell size must be positive.")
-    if derivative_name not in {"slope", "aspect"}:
-        raise ValueError("Derivative name must be 'slope' or 'aspect'.")
-
-    result = np.full(elevation.shape, np.nan, dtype=np.float32)
-    if min(elevation.shape) < 3:
-        return result
-
-    northwest = elevation[:-2, :-2]
-    north = elevation[:-2, 1:-1]
-    northeast = elevation[:-2, 2:]
-    west = elevation[1:-1, :-2]
-    east = elevation[1:-1, 2:]
-    southwest = elevation[2:, :-2]
-    south = elevation[2:, 1:-1]
-    southeast = elevation[2:, 2:]
-
-    dz_dx = (
-        (northeast + 2 * east + southeast)
-        - (northwest + 2 * west + southwest)
-    ) / (8 * cell_size)
-    # Raster rows increase southward, so reversing the row difference makes
-    # this derivative positive toward geographic north in EPSG:5070.
-    dz_dy = (
-        (northwest + 2 * north + northeast)
-        - (southwest + 2 * south + southeast)
-    ) / (8 * cell_size)
-
-    if derivative_name == "slope":
-        interior = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
-    else:
-        gradient_magnitude = np.hypot(dz_dx, dz_dy)
-        # Compass azimuth uses atan2(east, north) for the downslope vector.
-        interior = np.degrees(np.arctan2(-dz_dx, -dz_dy)) % 360
-        interior = np.where(gradient_magnitude == 0, np.nan, interior)
-
-    result[1:-1, 1:-1] = interior.astype(np.float32, copy=False)
-    return result
-
-
-def lazy_horn_derivative(
-    elevation: xr.DataArray,
-    cell_size: float,
-    output: str,
-) -> xr.DataArray:
-    """Create a lazy overlap-aware Horn terrain derivative.
-
-    Args:
-        elevation: Two-dimensional, Dask-backed elevation DataArray.
-        cell_size: Square raster-cell size in projected coordinate units.
-        output: Terrain derivative to return: ``"slope"`` or ``"aspect"``.
-
-    Returns:
-        Dask-backed DataArray on the same coordinates and chunks as elevation.
-
-    Raises:
-        ValueError: If elevation is not two-dimensional and Dask-backed.
-    """
-    if elevation.dims != ("y", "x") or not dask.is_dask_collection(elevation.data):
-        raise ValueError("Elevation must be a 2D Dask-backed (y, x) DataArray.")
-
-    # A 3x3 calculation needs one neighboring elevation pixel on every side.
-    # map_overlap borrows those pixels across INTERNAL 2048-pixel chunk edges,
-    # then trims the temporary overlap so the statewide shape is unchanged.
-    derivative_data = da.map_overlap(
-        horn_terrain_block,
-        elevation.data,
-        depth={0: INTERNAL_OVERLAP_PIXELS, 1: INTERNAL_OVERLAP_PIXELS},
-        boundary=np.nan,
-        trim=True,
-        dtype=np.float32,
-        cell_size=cell_size,
-        derivative_name=output,
-    )
-    return elevation.copy(data=derivative_data).rename(output)
 
 
 # %% Read and validate the prepared boundary and retained analysis grid
@@ -224,20 +120,35 @@ target_bounds = (
 )
 
 signed_items = [pc.sign(item) for item in selected_items]
-elevation_stack = stackstac.stack(
-    signed_items,
-    assets=["data"],
-    epsg=TARGET_EPSG,
-    resolution=TARGET_RESOLUTION_M,
-    bounds=target_bounds,
-    snap_bounds=False,
-    resampling=Resampling.bilinear,
-    chunksize=(1, 1, CHUNK_SIZE_PIXELS, CHUNK_SIZE_PIXELS),
-    dtype="float32",
-    fill_value=np.float32(np.nan),
-    rescale=False,
-    sortby_date=False,
-)
+
+# stackstac 0.5.0 still passes a no-op keyword removed by pandas 3. Keep the
+# compatibility adjustment local to stack construction and restore pandas
+# immediately afterward so the analysis does not alter unrelated behavior.
+original_to_datetime = stackstac.prepare.pd.to_datetime
+if "infer_datetime_format" not in inspect.signature(original_to_datetime).parameters:
+    def stackstac_to_datetime(*args, **kwargs):
+        kwargs.pop("infer_datetime_format", None)
+        return original_to_datetime(*args, **kwargs)
+
+    stackstac.prepare.pd.to_datetime = stackstac_to_datetime
+
+try:
+    elevation_stack = stackstac.stack(
+        signed_items,
+        assets=["data"],
+        epsg=TARGET_EPSG,
+        resolution=TARGET_RESOLUTION_M,
+        bounds=target_bounds,
+        snap_bounds=False,
+        resampling=Resampling.bilinear,
+        chunksize=(1, 1, CHUNK_SIZE_PIXELS, CHUNK_SIZE_PIXELS),
+        dtype="float32",
+        fill_value=np.float32(np.nan),
+        rescale=False,
+        sortby_date=False,
+    )
+finally:
+    stackstac.prepare.pd.to_datetime = original_to_datetime
 if elevation_stack.sizes.get("time") != len(selected_items):
     raise ValueError("The raster stack does not contain every selected Item.")
 if elevation_stack.sizes.get("band") != 1:
@@ -252,19 +163,31 @@ elevation_mosaic = stackstac.mosaic(
 # %% Construct lazy slope, raw aspect, and circular aspect components
 # Elevation must be mosaicked first: differentiating separate source Items would
 # treat tile edges as terrain edges and could create false slopes at overlaps.
-slope = lazy_horn_derivative(elevation_mosaic, TARGET_RESOLUTION_M, "slope")
-aspect = lazy_horn_derivative(elevation_mosaic, TARGET_RESOLUTION_M, "aspect")
+# xarray-spatial's planar terrain functions use a 3x3 Horn neighborhood. For
+# Dask arrays they internally request one pixel of map_overlap on every side,
+# protecting INTERNAL chunk boundaries while preserving lazy evaluation.
+slope = xrspatial_slope(elevation_mosaic, name="slope", method="planar")
+raw_aspect = xrspatial_aspect(
+    elevation_mosaic,
+    name="raw_aspect",
+    method="planar",
+)
+
+# xarray-spatial reports clockwise downslope azimuth in degrees from north and
+# uses -1 for flat pixels. Direction is undefined on flats, so replace that
+# sentinel with NaN rather than assigning a fake compass direction.
+raw_aspect = raw_aspect.where(raw_aspect >= 0)
 
 # Degrees wrap at north (359 degrees is close to 1 degree), so their arithmetic
 # mean is unsuitable for later 1-km aggregation. Creating components now lets a
 # later workflow aggregate circular direction safely. Undefined flat aspects
 # remain NaN through radians, sine, and cosine.
-aspect_radians = np.deg2rad(aspect)
+aspect_radians = np.deg2rad(raw_aspect)
 aspect_sin = np.sin(aspect_radians).rename("aspect_sin")
 aspect_cos = np.cos(aspect_radians).rename("aspect_cos")
 terrain_arrays = {
     "slope": slope,
-    "aspect": aspect,
+    "raw_aspect": raw_aspect,
     "aspect_sin": aspect_sin,
     "aspect_cos": aspect_cos,
 }
@@ -291,13 +214,16 @@ for name, terrain_array in terrain_arrays.items():
 
 print("LAZY NEW MEXICO TERRAIN ARRAYS")
 print("--------------------------------")
-print("Terrain method: Horn (1981) weighted 3x3 finite difference")
+print(f"xarray-spatial version: {version('xarray-spatial')}")
+print("Terrain method: xrspatial.slope/aspect (planar 3x3 Horn)")
+print("Aspect convention: clockwise downslope azimuth from north; flats -> NaN")
 print(f"Target CRS: {TARGET_CRS}")
 print(f"Pixel spacing (x, y): {x_spacing:g} m, {y_spacing:g} m")
 print(f"Outer terrain halo: {TERRAIN_HALO_M} m")
-print(f"Internal Dask overlap: {INTERNAL_OVERLAP_PIXELS} pixel")
+print("Internal Dask overlap: one pixel, handled by xarray-spatial map_overlap")
 print(f"Raster dimensions (y, x): {expected_shape[0]:,}, {expected_shape[1]:,}")
 print(f"Dask chunks: {expected_chunks}")
+print(f"elevation lazy / Dask-backed: {dask.is_dask_collection(elevation_mosaic.data)}")
 for name, terrain_array in terrain_arrays.items():
     print(f"{name} lazy / Dask-backed: {dask.is_dask_collection(terrain_array.data)}")
 
@@ -314,7 +240,7 @@ qa_indexers = {
 qa_loaded = dask.compute(
     elevation_mosaic.isel(**qa_indexers),
     slope.isel(**qa_indexers),
-    aspect.isel(**qa_indexers),
+    raw_aspect.isel(**qa_indexers),
     aspect_sin.isel(**qa_indexers),
     aspect_cos.isel(**qa_indexers),
 )
