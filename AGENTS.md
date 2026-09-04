@@ -318,12 +318,47 @@ For each task:
 After implementation:
 
 1. summarize files created or modified
-2. explain important implementation decisions
-3. report assumptions or issues
-4. show `git status`
-5. stop and wait for review
+2. provide a major-step walkthrough of the implemented workflow
+3. explain important implementation decisions
+4. identify any good engineering patterns used, such as batching, checkpointing,
+   validation, deterministic processing, bounded-memory design, modular pipelines,
+   or restartability
+5. provide a short 80/20 takeaway
+6. report assumptions or issues
+7. show `git status`
+8. stop and wait for review
 
-The human user reviews and commits changes.
+
+---
+## Learning-oriented implementation summaries
+
+When completing or substantially refactoring an analysis script, include a concise walkthrough of the script organized by its major processing steps.
+
+The walkthrough should:
+
+- explain the workflow in plain English before discussing implementation details
+- group the code into approximately 5–10 major steps
+- name the functions or code sections responsible for each step
+- explain what each major step accomplishes and why it exists
+- call out important geospatial, scientific, or data-engineering decisions
+- distinguish core logic from lower-priority plumbing or compatibility code
+- end with a short 80/20 takeaway describing the few ideas most important to understand
+
+Do not provide a line-by-line code explanation unless explicitly requested.
+
+Prefer a structure like:
+
+1. Validate inputs
+2. Find/select source data
+3. Define processing extent
+4. Process or transform data
+5. Aggregate to analysis units
+6. QA/QC
+7. Write final output
+
+The exact steps should reflect the actual script rather than forcing this template.
+
+
 
 ---
 
