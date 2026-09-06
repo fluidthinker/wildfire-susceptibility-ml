@@ -12,48 +12,125 @@ The reader should be able to understand the major scientific and data-processing
 
 Use normal `.py` files with VS Code `# %%` cell markers.
 
-Organize scripts into clear major workflow stages.
+Organize scripts so the file has a clear separation between:
 
-Prefer a structure such as:
+1. imports
+2. constants and paths
+3. helper function definitions
+4. the main workflow
+5. final QA/QC and visualization
 
-    # %% Parameters
+Prefer this general organization:
 
-    # %% Validate prepared inputs
+    # %% Imports
 
-    # %% Acquire or inspect source data
+    # %% Parameters and paths
 
-    # %% Select prototype or processing extent
+    # %% Helper functions
 
-    # %% Transform / reproject / process data
+    # %% Main workflow
 
-    # %% Aggregate to analysis cells
+    # %% Run script
 
-    # %% QA/QC
+The exact sections should reflect the actual workflow rather than forcing this template.
 
-    # %% Plot spatial QA
+---
 
-The exact stages should reflect the actual workflow rather than forcing this template.
+## Function placement
 
-Each `# %%` cell should have one clear responsibility.
+Unless there is a strong reason otherwise, define all helper functions before the executable workflow begins.
+
+Do not interleave function definitions with calls to those functions.
+
+Prefer:
+
+    imports
+    ↓
+    parameters
+    ↓
+    all helper functions
+    ↓
+    main()
+    ↓
+    if __name__ == "__main__":
+        main()
+
+This keeps the file easy to scan.
+
+The helper functions explain HOW individual steps work.
+
+The `main()` function explains WHAT happens and WHEN.
+
+---
+
+## Main workflow function
+
+Prefer a `main()` function for nontrivial analysis scripts.
+
+Define helper functions first, then place the high-level execution flow inside `main()`.
+
+The `main()` function should read like a concise workflow summary.
+
+It should make the major processing steps explicit with numbered step comments.
+
+Prefer:
+
+    def main():
+        """Run the PRISM precipitation prototype workflow."""
+
+        # STEP 1 — Acquire the authoritative source data
+        source_path = acquire_source(...)
+
+        # STEP 2 — Validate the source product and metadata
+        source = validate_source(...)
+
+        # STEP 3 — Select the prototype analysis cells
+        test_grid = select_test_grid(...)
+
+        # STEP 4 — Reproject and create the temporary integration surface
+        processed = transform_source(...)
+
+        # STEP 5 — Aggregate precipitation to 1-km analysis cells
+        features = aggregate_to_grid(...)
+
+        # STEP 6 — Validate the resulting feature table
+        validate_features(features)
+
+        # STEP 7 — Report QA/QC results
+        report_qaqc(...)
+
+        # STEP 8 — Create the spatial QA plot
+        plot_spatial_qa(...)
+
+
+    if __name__ == "__main__":
+        main()
+
+Keep `main()` focused on orchestration.
+
+Do not place most implementation detail directly inside `main()`.
+
+The reader should be able to understand the entire workflow by reading `main()` before reading any helper functions.
 
 ---
 
 ## Top-level workflow should read like a table of contents
 
-Do not place large amounts of detailed implementation logic directly in top-level cells when meaningful responsibilities can be expressed as functions.
+The executable workflow should call clearly named functions in a logical order.
 
-Prefer a top-level workflow such as:
+Prefer:
 
-    source_metadata = inspect_prism_source(...)
+    source_metadata = inspect_source(...)
     test_grid = select_test_grid(...)
-    precipitation_surface = reproject_precipitation_surface(...)
-    feature_table = aggregate_precipitation_to_grid(...)
+    processed_surface = reproject_source(...)
+    feature_table = aggregate_to_grid(...)
     validate_feature_table(feature_table)
+    report_qaqc(...)
     plot_spatial_qa(...)
 
 over one long procedural block containing all implementation details.
 
-The top-level analysis flow should make the major steps obvious.
+The workflow should be understandable at a glance.
 
 ---
 
@@ -70,6 +147,7 @@ Examples:
     reproject_precipitation_surface(...)
     aggregate_to_analysis_grid(...)
     validate_feature_table(...)
+    report_qaqc(...)
     plot_spatial_qa(...)
 
 Extract a function when doing so:
@@ -82,6 +160,8 @@ Extract a function when doing so:
 - provides likely reusable behavior
 
 Do not create tiny one-line functions merely to increase the number of functions.
+
+Prefer functions with one clear responsibility.
 
 ---
 
@@ -107,12 +187,13 @@ Example:
         """Reproject PRISM precipitation to an aligned integration grid.
 
         PRISM is treated as a continuous climate surface. Bilinear resampling
-        estimates precipitation between neighboring source cells while the raster
-        is transformed into EPSG:5070.
+        estimates precipitation between neighboring source cells while the
+        raster is transformed into EPSG:5070.
 
-        The finer integration grid is used to approximate the spatial mean within
-        each 1-km analysis cell. It does not create new climate information or
-        imply that PRISM has observations at the finer resolution.
+        The finer integration grid is used to approximate the spatial mean
+        within each 1-km analysis cell. It does not create new climate
+        information or imply that PRISM has observations at the finer
+        resolution.
 
         Args:
             source: Open PRISM raster dataset.
@@ -140,13 +221,11 @@ Use three levels of comments.
 
 ### 1. Major-step comments
 
-Explain where the reader is in the workflow.
+Use these inside `main()` so the workflow can be understood quickly.
 
 Example:
 
-    # -------------------------------------------------------------------------
     # STEP 4 — Reproject PRISM and create the temporary integration surface
-    # -------------------------------------------------------------------------
 
 ### 2. Decision comments
 
@@ -166,17 +245,18 @@ Example:
 
     # `reproject()` performs several operations together:
     #   1. maps locations from PRISM's native CRS into EPSG:5070,
-    #   2. estimates values at the new pixel locations using bilinear interpolation,
+    #   2. estimates values at new pixel locations using bilinear interpolation,
     #   3. writes those estimates onto the aligned destination grid.
     #
-    # The 100 m grid is an integration aid. It does not create new 100 m climate
-    # information from the ~800 m PRISM source.
+    # The 100 m grid is an integration aid. It does not create new 100 m
+    # climate information from the ~800 m PRISM source.
 
 Add mechanism comments especially around:
 
 - CRS transformations
 - Rasterio `reproject()`
-- raster resampling and interpolation
+- raster resampling
+- interpolation
 - raster windows
 - transforms and grid alignment
 - source support pixels / halos
@@ -184,12 +264,15 @@ Add mechanism comments especially around:
 - NumPy reshaping
 - multidimensional aggregation
 - zonal-style summaries
-- spatial joins and index mapping
+- spatial joins
+- index mapping
 - Dask lazy evaluation
 - chunking
 - batching
 - checkpoints
 - restart logic
+- file streaming
+- temporary `.part` files
 - compact comprehensions or expressions that hide important behavior
 
 Do not comment obvious assignments such as:
@@ -203,7 +286,7 @@ Do not comment obvious assignments such as:
 
 Do not optimize for shortest code.
 
-When a compact expression hides an important spatial or computational idea, introduce intermediate variables.
+When a compact expression hides an important spatial or computational idea, introduce descriptive intermediate variables.
 
 Avoid leaving important logic unexplained:
 
@@ -225,6 +308,10 @@ Prefer:
     cell_means = grouped_values.mean(axis=(1, 3))
 
 Readable code is preferred over clever code.
+
+Pythonic code means clear, idiomatic, maintainable, and easy to follow.
+
+It does not mean shortest possible code.
 
 ---
 
@@ -293,6 +380,8 @@ For new datasets or algorithms:
 
 Do not copy a complex architecture from another dataset unless the new workload demonstrates that it is necessary.
 
+Use the simplest architecture that safely fits the workload.
+
 ---
 
 ## Prototype-to-production refactoring
@@ -301,14 +390,39 @@ Before scaling a successful prototype statewide:
 
 1. preserve validated scientific behavior
 2. refactor substantial procedural blocks into meaningful functions
-3. improve names and intermediate variables
-4. add Google-style docstrings
-5. add major-step, decision, and mechanism comments
-6. ensure the top-level workflow is easy to read
-7. preserve or strengthen QA/QC
-8. move genuinely reusable logic into `src/` only when reuse is demonstrated
+3. define helper functions before the execution workflow
+4. put the high-level execution flow inside `main()`
+5. make the major workflow steps visible inside `main()`
+6. improve names and intermediate variables
+7. add Google-style docstrings
+8. add major-step, decision, and mechanism comments
+9. preserve or strengthen QA/QC
+10. move genuinely reusable logic into `src/` only when reuse is demonstrated
 
 Do not carry messy exploratory structure directly into production simply because the prototype produced correct output.
+
+---
+
+## Engineering patterns
+
+When relevant, make useful engineering patterns visible in comments or the implementation summary.
+
+Examples:
+
+- prototype → validate → scale
+- bounded-memory processing
+- streaming
+- reuse completed work
+- only mark work as finished after it succeeds
+- clean up partial work after failure
+- validation before reuse
+- batching
+- checkpointing
+- restartability
+- deterministic processing
+- modular feature pipelines
+- materialize only where persistence provides value
+- keep processing representation separate from final analysis representation
 
 ---
 
@@ -323,19 +437,8 @@ For each major step:
 - explain why the step exists
 - call out important scientific or engineering decisions
 
-Also identify useful engineering patterns such as:
+Also identify useful engineering patterns used.
 
-- prototype → validate → scale
-- bounded-memory processing
-- streaming
-- batching
-- checkpointing
-- deterministic processing
-- validation before reuse
-- restartability
-- safe temporary-file handling
-- modular feature pipelines
-
-End with an 80/20 takeaway describing the few ideas most important to understand.
+End with an **80/20 takeaway** describing the few ideas most important to understand.
 
 Do not provide a line-by-line explanation unless explicitly requested.
