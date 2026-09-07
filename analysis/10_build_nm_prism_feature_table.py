@@ -51,8 +51,9 @@ output_path = (
 
 
 # %% Helper functions
-def download_source_if_missing(url: str, destination: Path) -> None:
-    """Download the authoritative archive safely when it is not cached.
+
+def download_binary_file_if_missing(url: str, destination: Path) -> None:
+    """Download the PRISM authoritative archive safely when it is not cached.
 
     The response is streamed in bounded chunks so the archive is never held
     fully in memory. Bytes first go to a .part file and are renamed only after
