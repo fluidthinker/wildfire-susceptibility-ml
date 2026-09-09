@@ -68,7 +68,7 @@ shapefile_name = [
     for name in member_names
     if name.lower().endswith(".shp")
 ][0]
-
+# %% 
 vector_path = (
     f"zip://{mtbs_archive_path.as_posix()}!"
     f"{shapefile_name}"
@@ -106,7 +106,12 @@ print(mtbs.columns.tolist())
 print("\nGeometry types:")
 print(mtbs.geometry.geom_type.value_counts())
 
-
+# %% 
+mtbs.dtypes
+# %%
+mtbs.info()
+# %%
+mtbs.describe(include="all")
 # %% 6 — Inspect fire types
 mtbs["incid_type"].value_counts()
 
