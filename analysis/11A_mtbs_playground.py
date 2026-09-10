@@ -297,6 +297,24 @@ wildfire_union = union_all(
     selected_fires.geometry.to_numpy()
 )
 
+# %% 
+# %% Explore wildfire_union
+print("Geometry type:", wildfire_union.geom_type)
+print("Polygon parts:", len(wildfire_union.geoms))
+print("Total area m²:", wildfire_union.area)
+print("Bounds:", wildfire_union.bounds)
+
+first_polygon = wildfire_union.geoms[0]
+
+print("\nFirst polygon type:", first_polygon.geom_type)
+print("First polygon area m²:", first_polygon.area)
+
+coords = list(first_polygon.exterior.coords)
+
+print("Number of exterior coordinates:", len(coords))
+print("First 10 coordinates:")
+print(coords[:10])
+# %%
 print("Union geometry type:", wildfire_union.geom_type)
 print(
     "Unique burned area km²:",
