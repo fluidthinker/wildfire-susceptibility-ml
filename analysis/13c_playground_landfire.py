@@ -291,10 +291,14 @@ print(
 
 
 # %% 8 — Select analysis cells overlapping the prototype raster
-prototype_bbox = gpd.GeoSeries.from_bbox(
-    native_bounds,
-    crs=TARGET_CRS,
-).iloc[0]
+from shapely.geometry import box
+
+prototype_bbox = box(
+    native_bounds.left,
+    native_bounds.bottom,
+    native_bounds.right,
+    native_bounds.top,
+)
 
 prototype_grid = analysis_grid.loc[
     analysis_grid.geometry.intersects(
