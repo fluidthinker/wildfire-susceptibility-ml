@@ -311,6 +311,8 @@ print(
     len(prototype_grid),
 )
 
+# %%
+prototype_grid.head(5)
 
 # %% 9 — Plot native raster with 1-km analysis-cell boundaries
 fig, ax = plt.subplots(
@@ -481,7 +483,23 @@ print(
     "Invented classes:",
     invented_classes,
 )
+'''
+image below is:
+WHOLE FIGURE
+≈ several km × several km
 
+blue/cyan grid lines
+= boundaries of your 1-km analysis cells
+
+green/yellow interior
+= the reprojected LANDFIRE categorical raster
+
+purple around the outside
+= NoData, where the 25-m destination grid extends beyond
+  the small LANDFIRE source export
+
+
+'''
 
 # %% 15 — Plot the aligned 25-m categorical raster
 fig, ax = plt.subplots(
