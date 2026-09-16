@@ -233,7 +233,46 @@ After implementation:
 8. stop and wait for human review
 
 Do not provide a line-by-line explanation unless explicitly requested.
+---
+## Function design and responsibility
 
+Prefer small, clearly named functions with one primary responsibility.
+
+A function should answer one clear question or perform one clear job. Avoid
+large helpers that mix unrelated responsibilities such as loading data,
+validating inputs, transforming data, writing outputs, and recording
+provenance.
+
+Prefer composition such as:
+
+- `load_analysis_grid()`
+- `validate_analysis_grid_contract()`
+- `load_source_metadata()`
+- `validate_source_contract()`
+- `build_run_fingerprint()`
+
+over a single broad helper such as:
+
+- `prepare_everything()`
+- `validate_inputs()`
+- `process_data()`
+
+Do not split functions merely to reduce line count. Split when the code contains
+distinct conceptual responsibilities.
+
+## Data contracts
+
+Separate exploratory data discovery from production validation.
+
+Exploration and prototype code should determine what the source data are and
+establish the expected data contract.
+
+Production code should validate that current inputs still satisfy that known
+contract rather than repeatedly rediscovering the dataset.
+
+Mental model:
+
+Explore → understand → define contract → validate contract → process
 ---
 
 ## Guiding principle
