@@ -17,3 +17,4 @@ dependencies:
   - stackstac
   - dask
   - xarray-spatial
+  - python-duckdb
