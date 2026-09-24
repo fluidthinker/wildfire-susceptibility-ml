@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 from shapely import box
 
+from wildfire_susceptibility.spatial_blocks import assign_spatial_blocks, count_block_components
+
 
 # %% Parameters and paths
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,30 +118,6 @@ def join_modeling_geometry(cells: pd.DataFrame, grid: gpd.GeoDataFrame) -> gpd.G
     return joined.sort_values("cell_id").reset_index(drop=True)
 
 
-def assign_spatial_blocks(
-    cells: gpd.GeoDataFrame, grid_bounds: np.ndarray
-) -> tuple[gpd.GeoDataFrame, tuple[float, float]]:
-    """Place each eligible cell centroid in a deterministic regular 50-km block.
-
-    Args:
-        cells: Eligible cells in EPSG:5070.
-        grid_bounds: Bounds of the full authoritative grid, not an eligible subset.
-
-    Returns:
-        Cells with exploratory block positions and the snapped southwest anchor.
-    """
-    # Snapping the full grid bounds downward avoids moving the anchor when
-    # eligibility changes. For example, x=anchor_x+75,000 belongs to column 1.
-    anchor_x, anchor_y = np.floor(grid_bounds[:2] / BLOCK_SIZE_M) * BLOCK_SIZE_M
-    centroids = cells.geometry.centroid
-    assigned = cells.copy()
-    assigned["centroid_x"] = centroids.x
-    assigned["centroid_y"] = centroids.y
-    assigned["block_col"] = np.floor((centroids.x - anchor_x) / BLOCK_SIZE_M).astype("int64")
-    assigned["block_row"] = np.floor((centroids.y - anchor_y) / BLOCK_SIZE_M).astype("int64")
-    assigned["block_id"] = "r" + assigned.block_row.astype(str) + "_c" + assigned.block_col.astype(str)
-    return assigned, (float(anchor_x), float(anchor_y))
-
 
 def summarize_blocks(cells: gpd.GeoDataFrame, anchor: tuple[float, float]) -> gpd.GeoDataFrame:
     """Count eligible cells and positives within each occupied regular block.
@@ -194,31 +172,6 @@ def select_directional_holdout(blocks: gpd.GeoDataFrame, direction: str) -> gpd.
     selected = blocks[axis] <= cutoff if ascending else blocks[axis] >= cutoff
     return blocks.loc[selected].copy()
 
-
-def count_block_components(blocks: gpd.GeoDataFrame) -> int:
-    """Count connected groups using shared block edges rather than corner contact.
-
-    Args:
-        blocks: Selected occupied blocks with integer row/column positions.
-
-    Returns:
-        Number of four-neighbor connected components; one means contiguous.
-    """
-    remaining = set(zip(blocks.block_row, blocks.block_col))
-    components = 0
-    while remaining:
-        components += 1
-        frontier = [remaining.pop()]
-        while frontier:
-            row, col = frontier.pop()
-            # Only north/south/east/west adjacency qualifies. An unoccupied
-            # block does not bridge two groups of selected occupied blocks.
-            neighbors = ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1))
-            for neighbor in neighbors:
-                if neighbor in remaining:
-                    remaining.remove(neighbor)
-                    frontier.append(neighbor)
-    return components
 
 
 def summarize_holdout_candidate(
@@ -387,7 +340,7 @@ def main() -> None:
 
     # STEP 2 - Assign deterministic candidate 50-km blocks from cell centroids.
     # Anchor to the full grid so exclusions cannot shift the block system.
-    cells, anchor = assign_spatial_blocks(cells, grid.total_bounds)
+    cells, anchor = assign_spatial_blocks(cells, grid.total_bounds, BLOCK_SIZE_M)
 
     # STEP 3 - Summarize occupied blocks and their eligible positive populations.
     # Block counts reveal how much support exists for later spatial evaluation.
