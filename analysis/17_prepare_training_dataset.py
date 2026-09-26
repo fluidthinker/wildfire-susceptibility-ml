@@ -317,8 +317,33 @@ def main() -> None:
     # STEP 8 - Record the exact population and both saved CV compositions.
     # This documents the reusable input boundary for later experiments.
     report_training_dataset(training, qa, perf_counter() - started)
+    print("Reporting training dataset...")
+    report_function(training)
+
+# %% 
+def report_function(training_rows):
+    print("Training rows shape:", training_rows.shape)
+  
+
+    print("Training rows head:\n", training_rows.head())
+
+    print("First training row:\n", training_rows.iloc[0])
+
+    print("Target value counts:\n", training_rows["target"].value_counts())
+
+    print("Crosstab of random CV fold and target:\n", pd.crosstab(
+         training_rows["random_cv_fold"],
+         training_rows["target"],
+     ))
+
+    
 
 
 # %% Run script
 if __name__ == "__main__":
     main()
+
+
+# %% Report training rows
+
+# %%
