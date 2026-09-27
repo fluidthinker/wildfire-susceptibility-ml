@@ -203,3 +203,10 @@ def main() -> None:
 # %% Run script
 if __name__ == "__main__":
     main()
+
+# %%
+random = json.loads(RANDOM_SUMMARY_PATH.read_text(encoding="utf-8"))
+
+# %%
+print(random)
+# %%
