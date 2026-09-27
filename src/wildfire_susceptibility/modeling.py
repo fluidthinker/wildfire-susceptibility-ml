@@ -1,10 +1,14 @@
-"""Shared Logistic Regression, probability metrics, and CV result comparison."""
+"""Shared model pipelines, frozen-CV mechanics, and result comparison."""
 
+from collections.abc import Callable
+import json
+from pathlib import Path
 from time import perf_counter
 import warnings
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -199,6 +203,28 @@ def build_logistic_pipeline() -> Pipeline:
     return Pipeline([("preprocessing", preprocessing), ("model", model)])
 
 
+def build_random_forest_pipeline() -> Pipeline:
+    """Create an untuned forest with nominal EVT encoding and no numeric scaling.
+
+    Undefined flat-terrain aspect is imputed to zero inside each fold. Sparse
+    one-hot encoding avoids imposing an ordering on arbitrary EVT codes.
+
+    Returns:
+        Fresh preprocessing and 300-tree Random Forest pipeline.
+    """
+    preprocessing = ColumnTransformer([
+        ("continuous", "passthrough", list(CONTINUOUS_COLUMNS)),
+        ("aspect", SimpleImputer(strategy="constant", fill_value=0, keep_empty_features=True), list(ASPECT_COLUMNS)),
+        ("vegetation", OneHotEncoder(handle_unknown="ignore", sparse_output=True), list(CATEGORICAL_COLUMNS)),
+    ], remainder="drop", sparse_threshold=1.0)
+    model = RandomForestClassifier(
+        n_estimators=300, random_state=42, n_jobs=-1, class_weight=None,
+        criterion="gini", max_depth=None, min_samples_split=2,
+        min_samples_leaf=1, max_features="sqrt", bootstrap=True,
+    )
+    return Pipeline([("preprocessing", preprocessing), ("model", model)])
+
+
 def calculate_probability_metrics(target: np.ndarray, probability: np.ndarray) -> dict[str, float]:
     """Measure ranking performance without choosing a classification threshold.
 
@@ -224,7 +250,8 @@ def calculate_probability_metrics(target: np.ndarray, probability: np.ndarray) -
 
 
 def fit_validation_fold(
-    features: pd.DataFrame, target: pd.Series, validation: pd.Series, fold: int
+    features: pd.DataFrame, target: pd.Series, validation: pd.Series, fold: int,
+    pipeline_factory: Callable[[], Pipeline] = build_logistic_pipeline,
 ) -> tuple[np.ndarray, dict]:
     """Fit a fresh pipeline on four folds and predict only the held-out fold.
 
@@ -233,6 +260,7 @@ def fit_validation_fold(
         target: Binary target aligned with features.
         validation: True only for this fold's held-out rows.
         fold: Label included in warning diagnostics.
+        pipeline_factory: Callable returning a fresh unfitted model pipeline.
 
     Returns:
         Held-out class-1 probabilities and fit diagnostics, including warnings.
@@ -242,7 +270,7 @@ def fit_validation_fold(
     """
     if list(features.columns) != list(PREDICTORS):
         raise ValueError("X must contain only the explicit predictor list")
-    pipeline = build_logistic_pipeline()
+    pipeline = pipeline_factory()
     started = perf_counter()
     # Fit calls each transformer using only the four training folds. Validation
     # categories never enter the encoder vocabulary or numeric scaling estimates.
@@ -255,8 +283,182 @@ def fit_validation_fold(
     messages = [{"category": warning.category.__name__, "message": str(warning.message)} for warning in captured]
     for message in messages:
         print(f"Fold {fold} warning: {message}", flush=True)
-    return probabilities, {
-        "fold": fold, "iterations": int(pipeline.named_steps["model"].n_iter_[0]),
+    model = pipeline.named_steps["model"]
+    diagnostic = {
+        "fold": fold,
         "runtime_seconds": round(perf_counter() - started, 3), "warnings": messages,
         "convergence_warning": any(issubclass(w.category, ConvergenceWarning) for w in captured),
     }
+    if hasattr(model, "n_iter_"):
+        diagnostic["iterations"] = int(model.n_iter_[0])
+    if isinstance(model, RandomForestClassifier):
+        diagnostic["trees"] = len(model.estimators_)
+    return probabilities, diagnostic
+
+
+def validate_training_input(data: pd.DataFrame, expected_folds: list[tuple[int, int]], aspect_missing: int) -> None:
+    """Enforce the approved training population and frozen random-fold contract.
+
+    Args:
+        data: Raw training-only dataset.
+        expected_folds: Frozen (row, positive) counts in fold-label order.
+        aspect_missing: Approved missing count for each aspect feature.
+
+    Raises:
+        ValueError: If schema, keys, target, missingness, or fold counts changed.
+    """
+    expected_rows = sum(rows for rows, _ in expected_folds)
+    expected_positives = sum(positives for _, positives in expected_folds)
+    metadata = {"cell_id", "spatial_block_id", "random_cv_fold", "spatial_cv_fold"}
+    if set(data.columns) != set(PREDICTORS) | metadata | {"target"}:
+        raise ValueError("Unexpected training schema; only approved predictors, target, and metadata are allowed")
+    wrong_rows = len(data) != expected_rows
+    invalid_keys = data.cell_id.isna().any() or data.cell_id.duplicated().any()
+    if wrong_rows or invalid_keys:
+        raise ValueError(f"Training requires {expected_rows:,} uniquely keyed, nonmissing cell IDs")
+    if data.target.value_counts().to_dict() != {0: expected_rows - expected_positives, 1: expected_positives} or data.target.isna().any():
+        raise ValueError("Training binary target counts changed")
+    if not pd.api.types.is_integer_dtype(data.random_cv_fold) or data.random_cv_fold.isna().any():
+        raise ValueError("Saved random folds must be nonmissing integers")
+    if set(data.random_cv_fold) != set(range(len(expected_folds))):
+        raise ValueError("Unexpected saved random fold labels")
+    counts = data.groupby("random_cv_fold").target.agg(["size", "sum"])
+    if list(counts.itertuples(index=False, name=None)) != expected_folds:
+        raise ValueError(f"Frozen random fold populations changed: {counts}")
+    for column in PREDICTORS:
+        expected_missing = aspect_missing if column in ASPECT_COLUMNS else 0
+        if data[column].isna().sum() != expected_missing:
+            raise ValueError(f"{column}: expected {expected_missing} missing values")
+        if not pd.api.types.is_numeric_dtype(data[column]) or np.isinf(data[column].dropna()).any():
+            raise ValueError(f"{column}: unexpected nonnumeric or infinite values")
+    if not pd.api.types.is_integer_dtype(data.evt_dominant_class):
+        raise ValueError("EVT must retain its original integer categorical identifiers")
+
+
+def validate_fold_partition(
+    data: pd.DataFrame, validation: pd.Series, fold: int,
+    expected_folds: list[tuple[int, int]],
+) -> None:
+    """Check that one saved validation fold and its complement cover training.
+
+    Args:
+        data: Validated complete training population.
+        validation: Boolean selection derived directly from saved random folds.
+        fold: Frozen validation label.
+        expected_folds: Approved (row, positive) counts for each fold.
+
+    Raises:
+        ValueError: If membership, counts, classes, or disjointness fail.
+    """
+    if not validation.equals(data.random_cv_fold.eq(fold)):
+        raise ValueError("Validation membership differs from saved random folds")
+    train = data.loc[~validation]
+    held_out = data.loc[validation]
+    if len(train) + len(held_out) != len(data) or set(train.cell_id) & set(held_out.cell_id):
+        raise ValueError(f"Fold {fold}: train/validation coverage or overlap failure")
+    if (len(held_out), int(held_out.target.sum())) != expected_folds[fold]:
+        raise ValueError(f"Fold {fold}: validation population differs from saved design")
+    if set(train.target) != {0, 1} or set(held_out.target) != {0, 1}:
+        raise ValueError(f"Fold {fold}: both classes must occur in each partition")
+
+
+def run_random_cv(
+    data: pd.DataFrame, features: pd.DataFrame, oof: pd.DataFrame,
+    expected_folds: list[tuple[int, int]], pipeline_factory: Callable[[], Pipeline],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Populate one OOF probability per row using only the saved random labels.
+
+    Args:
+        data: Validated raw training population.
+        features: Predictor-only table aligned with data.
+        oof: Output storage with an initially missing probability column.
+        expected_folds: Approved (row, positive) counts for each fold.
+        pipeline_factory: Callable returning a fresh model for every fit.
+
+    Returns:
+        Fold metrics and diagnostics; OOF storage is filled in place.
+
+    Raises:
+        ValueError: If any row receives other than one validation prediction.
+    """
+    if not data.index.is_unique or not features.index.equals(data.index) or not oof.index.equals(data.index):
+        raise ValueError("Training, predictors, and OOF storage must have matching unique indices")
+    assignment_counts = np.zeros(len(data), dtype=np.uint8)
+    metrics, diagnostics = [], []
+    for fold in range(len(expected_folds)):
+        validation = data.random_cv_fold.eq(fold)
+        validate_fold_partition(data, validation, fold, expected_folds)
+        print(f"Fitting saved random fold {fold}...", flush=True)
+        probabilities, diagnostic = fit_validation_fold(features, data.target, validation, fold, pipeline_factory)
+        oof.loc[validation, "predicted_probability"] = probabilities
+        assignment_counts[validation.to_numpy(dtype=bool)] += 1
+        labels = data.loc[validation, "target"]
+        scores = calculate_probability_metrics(labels.to_numpy(), probabilities)
+        metrics.append({"fold": fold, "rows": len(labels), "positives": int(labels.sum()),
+                        "positive_prevalence": float(labels.mean()), **scores})
+        diagnostics.append(diagnostic)
+        print(f"Fold {fold}: {scores}; runtime={diagnostic['runtime_seconds']} seconds", flush=True)
+    if not np.all(assignment_counts == 1):
+        raise ValueError("Every training row must receive exactly one held-out probability")
+    return pd.DataFrame(metrics), diagnostics
+
+
+def validate_oof_predictions(oof: pd.DataFrame, data: pd.DataFrame) -> None:
+    """Verify complete probability coverage and exact preservation of row identity.
+
+    Args:
+        oof: Proposed or read-back out-of-fold predictions.
+        data: Original training-only data.
+
+    Raises:
+        ValueError: If output schema, keys, or probabilities are invalid.
+        AssertionError: If target labels or frozen fold membership changed.
+    """
+    if list(oof.columns) != ["cell_id", "target", "random_cv_fold", "predicted_probability"] or len(oof) != len(data):
+        raise ValueError("Unexpected OOF schema or row count")
+    if oof.cell_id.isna().any() or oof.cell_id.duplicated().any():
+        raise ValueError("OOF keys must be unique and nonmissing")
+    identity = ["cell_id", "target", "random_cv_fold"]
+    pd.testing.assert_frame_equal(oof[identity], data[identity], check_exact=True)
+    probability = oof.predicted_probability.to_numpy()
+    if not np.isfinite(probability).all() or ((probability < 0) | (probability > 1)).any():
+        raise ValueError("OOF probabilities must all be populated, finite, and in [0,1]")
+
+
+def publish_results(
+    oof: pd.DataFrame, folds: pd.DataFrame, summary: dict, data: pd.DataFrame, output_dir: Path,
+) -> None:
+    """Stage and verify all three outputs before publishing each final file.
+
+    Args:
+        oof: Validated held-out probabilities.
+        folds: Fold metrics.
+        summary: JSON-compatible summary of the experiment.
+        data: Original training rows for read-back validation.
+        output_dir: Destination directory for this experiment.
+
+    Raises:
+        ValueError: If stored predictions violate their contract.
+        AssertionError: If any artifact changes during serialization.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destinations = [output_dir / name for name in
+                    ("oof_predictions.parquet", "fold_metrics.csv", "summary_metrics.json")]
+    partials = [path.with_suffix(path.suffix + ".part") for path in destinations]
+    try:
+        oof.to_parquet(partials[0], index=False, compression="zstd")
+        folds.to_csv(partials[1], index=False)
+        partials[2].write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        written = pd.read_parquet(partials[0])
+        validate_oof_predictions(written, data)
+        pd.testing.assert_frame_equal(written, oof, check_exact=True)
+        pd.testing.assert_frame_equal(pd.read_csv(partials[1], float_precision="round_trip"), folds, check_exact=True)
+        if json.loads(partials[2].read_text(encoding="utf-8")) != summary:
+            raise ValueError("Summary read-back differs")
+        # Each replacement is atomic; these three files are not a filesystem transaction.
+        # Summary is published last, after the predictions and fold metrics succeed.
+        for partial, destination in zip(partials, destinations):
+            partial.replace(destination)
+    finally:
+        for partial in partials:
+            partial.unlink(missing_ok=True)

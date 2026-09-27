@@ -1,4 +1,4 @@
-"""Evaluate Logistic Regression using the five saved random CV folds only.
+"""Evaluate Random Forest using the five saved random CV folds only.
 
 Only the raw training-only Parquet is read. No threshold, spatial evaluation,
 hyperparameter search, or final-test access is part of this experiment.
@@ -16,7 +16,7 @@ import sklearn
 
 from wildfire_susceptibility.modeling import (
     ASPECT_COLUMNS, CATEGORICAL_COLUMNS, CONTINUOUS_COLUMNS, PREDICTORS,
-    build_logistic_pipeline, calculate_probability_metrics,
+    build_random_forest_pipeline, calculate_probability_metrics,
     validate_training_input, run_random_cv, validate_oof_predictions, publish_results,
 )
 
@@ -24,7 +24,7 @@ from wildfire_susceptibility.modeling import (
 # %% Parameters and paths
 ROOT = Path(__file__).resolve().parents[1]
 INPUT_PATH = ROOT / "data/processed/modeling/nm_training_dataset.parquet"
-OUTPUT_DIR = ROOT / "outputs/modeling/logistic_random_cv"
+OUTPUT_DIR = ROOT / "outputs/modeling/random_forest_random_cv"
 EXPECTED_ROWS = 252_569
 EXPECTED_FOLDS = [(50514, 1317), (50514, 1317), (50514, 1317), (50514, 1317), (50513, 1317)]
 
@@ -36,14 +36,14 @@ def summarize_experiment(oof: pd.DataFrame, folds: pd.DataFrame, diagnostics: li
     Args:
         oof: Complete validated held-out predictions.
         folds: Per-fold probability metrics.
-        diagnostics: Iteration counts and captured warnings for every fit.
+        diagnostics: Tree counts, runtimes, and captured warnings for every fit.
 
     Returns:
         JSON-compatible experiment metadata and metrics; std uses ddof=1.
     """
     combined = calculate_probability_metrics(oof.target.to_numpy(), oof.predicted_probability.to_numpy())
     return {
-        "model": "LogisticRegression", "validation_method": "frozen random 5-fold CV",
+        "model": "RandomForestClassifier", "validation_method": "frozen random 5-fold CV",
         "rows": len(oof), "positives": int(oof.target.sum()), "negatives": int(oof.target.eq(0).sum()),
         "positive_prevalence": float(oof.target.mean()), "fold_count": 5,
         "roc_auc_oof": combined["roc_auc"], "pr_auc_oof": combined["pr_auc"],
@@ -52,11 +52,11 @@ def summarize_experiment(oof: pd.DataFrame, folds: pd.DataFrame, diagnostics: li
         "fold_std_ddof": 1, "pr_auc_definition": "average_precision_score; not trapezoidal PR area",
         "predictors": list(PREDICTORS),
         "preprocessing": {"continuous": list(CONTINUOUS_COLUMNS), "aspect": list(ASPECT_COLUMNS),
-                          "aspect_imputation": "constant 0 before scaling, pipeline only",
-                          "numeric_scaling": "StandardScaler fitted within each training fold",
+                          "aspect_imputation": "constant 0, pipeline only",
+                          "numeric_scaling": "none; numeric predictors remain unscaled",
                           "categorical": list(CATEGORICAL_COLUMNS), "encoding": "OneHotEncoder(handle_unknown='ignore')"},
-        "model_parameters": build_logistic_pipeline().named_steps["model"].get_params(),
-        "regularization": "L2 (l1_ratio=0), C=1.0", "fold_diagnostics": diagnostics,
+        "model_parameters": build_random_forest_pipeline().named_steps["model"].get_params(),
+        "fold_diagnostics": diagnostics,
         "saved_random_folds_reused": True, "final_test_accessed": False,
         "all_oof_probabilities_populated": True,
         "input_path": INPUT_PATH.relative_to(ROOT).as_posix(),
@@ -83,8 +83,9 @@ def main() -> None:
     oof["predicted_probability"] = np.nan
 
     # STEP 4 - Fit five fresh pipelines using only saved random fold membership.
+    # Each forest has 300 trees; numeric values are unscaled and EVT is nominal.
     # Every validation probability comes from a model that excluded that row.
-    folds, diagnostics = run_random_cv(data, features, oof, EXPECTED_FOLDS, build_logistic_pipeline)
+    folds, diagnostics = run_random_cv(data, features, oof, EXPECTED_FOLDS, build_random_forest_pipeline)
 
     # STEP 5 - Verify complete held-out coverage and unchanged input data.
     validate_oof_predictions(oof, data)
@@ -101,6 +102,8 @@ def main() -> None:
     publish_results(oof, folds, summary, data, OUTPUT_DIR)
 
     # STEP 8 - Report evidence and warnings without proceeding to another experiment.
+    print(folds.to_string(index=False), flush=True)
+    print(f"Outputs: {OUTPUT_DIR}", flush=True)
     print(json.dumps(summary, indent=2, allow_nan=False), flush=True)
     print(f"Total runtime including publication: {perf_counter() - started:.3f} seconds", flush=True)
 
