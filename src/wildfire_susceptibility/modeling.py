@@ -1,4 +1,4 @@
-"""Shared, untuned Logistic Regression definition and probability metrics."""
+"""Shared Logistic Regression, probability metrics, and CV result comparison."""
 
 from time import perf_counter
 import warnings
@@ -20,6 +20,155 @@ CONTINUOUS_COLUMNS = (
 ASPECT_COLUMNS = ("aspect_sin_mean", "aspect_cos_mean", "aspect_strength")
 CATEGORICAL_COLUMNS = ("evt_dominant_class",)
 PREDICTORS = (*CONTINUOUS_COLUMNS, *ASPECT_COLUMNS, *CATEGORICAL_COLUMNS)
+
+# Reporting names preserve the existing stored Average Precision definition.
+COMPARISON_METRICS = {
+    "roc_auc_oof": "roc_auc_oof",
+    "average_precision_oof": "pr_auc_oof",
+    "roc_auc_fold_mean": "roc_auc_fold_mean",
+    "roc_auc_fold_std": "roc_auc_fold_std",
+    "average_precision_fold_mean": "pr_auc_fold_mean",
+    "average_precision_fold_std": "pr_auc_fold_std",
+}
+
+
+def validate_comparable_summaries(random: dict, spatial: dict) -> dict:
+    """Require matching experiment contracts before comparing validation designs.
+
+    Population identity relies on saved provenance, without reopening row data.
+    Missing hashes are reported as unverified rather than treated as a match.
+
+    Args:
+        random: Saved random-CV summary for any model family.
+        spatial: Saved spatial-CV summary using the same core result schema.
+
+    Returns:
+        Verified comparison flags; same_input_hash is null if either is absent.
+
+    Raises:
+        ValueError: If required metadata or metrics are absent or incompatible.
+    """
+    same_fields = (
+        "model", "rows", "positives", "negatives", "predictors", "preprocessing",
+        "model_parameters", "fold_count", "input_path", "pr_auc_definition", "fold_std_ddof",
+    )
+    for field in same_fields:
+        if field not in random or field not in spatial or random[field] != spatial[field]:
+            raise ValueError(f"Comparison contract differs or is missing: {field}")
+    for strategy, summary in (("random", random), ("spatial", spatial)):
+        for field in ("rows", "positives", "negatives", "fold_count"):
+            if type(summary[field]) is not int or summary[field] <= 0:
+                raise ValueError(f"{strategy}: {field} must be a positive integer")
+        if summary["fold_count"] < 2 or summary["rows"] != summary["positives"] + summary["negatives"]:
+            raise ValueError(f"{strategy}: inconsistent population or fold count")
+        prevalence = summary.get("positive_prevalence", np.nan)
+        if not np.isclose(prevalence, summary["positives"] / summary["rows"], rtol=0, atol=1e-12):
+            raise ValueError(f"{strategy}: inconsistent positive prevalence")
+        if summary.get("final_test_accessed") is not False:
+            raise ValueError(f"{strategy}: final-test exclusion must be explicit")
+        if summary.get("all_oof_probabilities_populated") is not True:
+            raise ValueError(f"{strategy}: complete OOF coverage must be explicit")
+        if summary.get(f"saved_{strategy}_folds_reused") is not True:
+            raise ValueError(f"{strategy}: frozen fold reuse must be explicit")
+        expected_method = f"frozen {strategy} {summary['fold_count']}-fold CV"
+        if summary.get("validation_method") != expected_method:
+            raise ValueError(f"{strategy}: unexpected validation method")
+        if summary["pr_auc_definition"] != "average_precision_score; not trapezoidal PR area":
+            raise ValueError("Comparison requires the established Average Precision definition")
+        if summary["fold_std_ddof"] != 1:
+            raise ValueError("Fold variability must use sample standard deviation (ddof=1)")
+        for field in COMPARISON_METRICS.values():
+            value = summary.get(field)
+            if type(value) not in (int, float) or not np.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{strategy}: invalid metric {field}")
+        fingerprint = summary.get("input_sha256")
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str) or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError(f"{strategy}: invalid input SHA-256")
+    if not np.isclose(random["positive_prevalence"], spatial["positive_prevalence"], rtol=0, atol=1e-12):
+        raise ValueError("Positive prevalences differ")
+    hashes_available = all(summary.get("input_sha256") is not None for summary in (random, spatial))
+    if hashes_available and random["input_sha256"] != spatial["input_sha256"]:
+        raise ValueError("Training input SHA-256 fingerprints differ")
+    return {
+        "same_input_hash": True if hashes_available else None,
+        "same_predictors": True, "same_preprocessing": True,
+        "same_model_parameters": True, "same_training_population": True,
+        "population_validation_basis": "saved population counts, input path, and available SHA-256",
+        "final_test_accessed": False,
+    }
+
+
+def validate_fold_metrics(folds: pd.DataFrame, summary: dict) -> None:
+    """Reconcile saved fold populations and variability with an experiment summary.
+
+    Combined OOF metrics cannot be reconstructed from fold means; they remain
+    authoritative summary values. Floating-point comparisons allow only 1e-12.
+
+    Args:
+        folds: Saved fold metric table, with optional spatial block counts.
+        summary: Experiment summary already checked for comparability.
+
+    Raises:
+        ValueError: If fold identities, counts, metrics, or summary statistics fail.
+    """
+    required = {"fold", "rows", "positives", "positive_prevalence", "roc_auc", "pr_auc"}
+    if not required.issubset(folds.columns) or len(folds) != summary["fold_count"]:
+        raise ValueError("Fold table schema or row count is invalid")
+    integer_columns = ["fold", "rows", "positives"]
+    if "spatial_block_count" in summary:
+        if "blocks" not in folds:
+            raise ValueError("Spatial fold block counts are missing")
+        integer_columns.append("blocks")
+    for column in integer_columns:
+        if not pd.api.types.is_integer_dtype(folds[column]) or folds[column].isna().any():
+            raise ValueError(f"Fold {column} must contain nonmissing integers")
+    if set(folds.fold) != set(range(summary["fold_count"])):
+        raise ValueError("Fold labels must occur exactly once, from zero to fold_count - 1")
+    if (folds.positives <= 0).any() or (folds.positives >= folds.rows).any():
+        raise ValueError("Every fold must contain both target classes")
+    if folds.rows.sum() != summary["rows"] or folds.positives.sum() != summary["positives"]:
+        raise ValueError("Fold populations disagree with the summary")
+    if not np.allclose(folds.positive_prevalence, folds.positives / folds.rows, rtol=0, atol=1e-12):
+        raise ValueError("Fold prevalences disagree with counts")
+    if "spatial_block_count" in summary:
+        if (folds.blocks <= 0).any() or folds.blocks.sum() != summary["spatial_block_count"]:
+            raise ValueError("Spatial block counts disagree with the summary")
+    for metric in ("roc_auc", "pr_auc"):
+        values = folds[metric].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
+            raise ValueError(f"Invalid fold metric: {metric}")
+        for statistic, value in (("mean", values.mean()), ("std", values.std(ddof=1))):
+            if not np.isclose(value, summary[f"{metric}_fold_{statistic}"], rtol=0, atol=1e-12):
+                raise ValueError(f"Fold {metric} {statistic} disagrees with summary")
+
+
+def build_validation_comparison(random: dict, spatial: dict) -> tuple[pd.DataFrame, dict]:
+    """Extract two comparable result rows and signed Spatial-minus-Random changes.
+
+    Args:
+        random: Random-CV summary; no model-specific parameters are assumed.
+        spatial: Spatial-CV summary with a matching experiment contract.
+
+    Returns:
+        Comparison table and absolute metric differences (not relative changes).
+
+    Raises:
+        ValueError: If experiment summaries are incompatible.
+    """
+    validate_comparable_summaries(random, spatial)
+    records = []
+    for label, summary in (("Random CV", random), ("Spatial CV", spatial)):
+        record = {"model": summary["model"], "validation_strategy": label}
+        record.update({label: summary[source] for label, source in COMPARISON_METRICS.items()})
+        records.append(record)
+    changes = {
+        "roc_auc": spatial["roc_auc_oof"] - random["roc_auc_oof"],
+        "average_precision": spatial["pr_auc_oof"] - random["pr_auc_oof"],
+    }
+    return pd.DataFrame(records), changes
 
 
 def build_logistic_pipeline() -> Pipeline:
