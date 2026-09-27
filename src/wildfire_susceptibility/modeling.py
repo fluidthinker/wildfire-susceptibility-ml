@@ -1,6 +1,11 @@
 """Shared, untuned Logistic Regression definition and probability metrics."""
 
+from time import perf_counter
+import warnings
+
 import numpy as np
+import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -66,3 +71,43 @@ def calculate_probability_metrics(target: np.ndarray, probability: np.ndarray) -
         raise ValueError("Probabilities must be finite and in [0, 1]")
     return {"roc_auc": float(roc_auc_score(target, probability)),
             "pr_auc": float(average_precision_score(target, probability))}
+
+
+
+def fit_validation_fold(
+    features: pd.DataFrame, target: pd.Series, validation: pd.Series, fold: int
+) -> tuple[np.ndarray, dict]:
+    """Fit a fresh pipeline on four folds and predict only the held-out fold.
+
+    Args:
+        features: Explicit predictor columns, without metadata or target.
+        target: Binary target aligned with features.
+        validation: True only for this fold's held-out rows.
+        fold: Label included in warning diagnostics.
+
+    Returns:
+        Held-out class-1 probabilities and fit diagnostics, including warnings.
+
+    Raises:
+        ValueError: If predictors or fitted class ordering are unexpected.
+    """
+    if list(features.columns) != list(PREDICTORS):
+        raise ValueError("X must contain only the explicit predictor list")
+    pipeline = build_logistic_pipeline()
+    started = perf_counter()
+    # Fit calls each transformer using only the four training folds. Validation
+    # categories never enter the encoder vocabulary or numeric scaling estimates.
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        pipeline.fit(features.loc[~validation], target.loc[~validation])
+        if list(pipeline.named_steps["model"].classes_) != [0, 1]:
+            raise ValueError("Expected class-1 probability in predict_proba column 1")
+        probabilities = pipeline.predict_proba(features.loc[validation])[:, 1]
+    messages = [{"category": warning.category.__name__, "message": str(warning.message)} for warning in captured]
+    for message in messages:
+        print(f"Fold {fold} warning: {message}", flush=True)
+    return probabilities, {
+        "fold": fold, "iterations": int(pipeline.named_steps["model"].n_iter_[0]),
+        "runtime_seconds": round(perf_counter() - started, 3), "warnings": messages,
+        "convergence_warning": any(issubclass(w.category, ConvergenceWarning) for w in captured),
+    }
