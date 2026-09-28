@@ -1,4 +1,4 @@
-"""Compare completed Logistic Regression Random and Spatial CV results only."""
+"""Compare completed Random Forest Random and Spatial CV results only."""
 
 # %% Imports
 from pathlib import Path
@@ -13,13 +13,13 @@ EXPECTED_POPULATION = {"rows": 252_569, "positives": 6_585, "negatives": 245_984
 
 # %% Main workflow
 def main() -> None:
-    """Publish the saved Logistic Regression validation comparison."""
+    """Publish the saved Random Forest validation comparison."""
     # The shared workflow loads summaries, validates comparability and folds,
     # builds the table and figure, then validates and publishes all artifacts.
     run_validation_comparison(
-        ROOT, model_key="logistic", model_label="Logistic Regression",
-        expected_model="LogisticRegression", expected_population=EXPECTED_POPULATION,
-        require_input_hash=False,
+        ROOT, model_key="random_forest", model_label="Random Forest",
+        expected_model="RandomForestClassifier", expected_population=EXPECTED_POPULATION,
+        require_input_hash=True,
     )
 
 
