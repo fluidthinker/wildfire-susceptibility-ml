@@ -276,7 +276,9 @@ def fit_validation_fold(
     # categories never enter the encoder vocabulary or numeric scaling estimates.
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
+        fit_started = perf_counter()
         pipeline.fit(features.loc[~validation], target.loc[~validation])
+        fit_runtime_seconds = perf_counter() - fit_started
         if list(pipeline.named_steps["model"].classes_) != [0, 1]:
             raise ValueError("Expected class-1 probability in predict_proba column 1")
         probabilities = pipeline.predict_proba(features.loc[validation])[:, 1]
@@ -286,6 +288,7 @@ def fit_validation_fold(
     model = pipeline.named_steps["model"]
     diagnostic = {
         "fold": fold,
+        "fit_runtime_seconds": round(fit_runtime_seconds, 3),
         "runtime_seconds": round(perf_counter() - started, 3), "warnings": messages,
         "convergence_warning": any(issubclass(w.category, ConvergenceWarning) for w in captured),
     }
@@ -296,13 +299,18 @@ def fit_validation_fold(
     return probabilities, diagnostic
 
 
-def validate_training_input(data: pd.DataFrame, expected_folds: list[tuple[int, int]], aspect_missing: int) -> None:
-    """Enforce the approved training population and frozen random-fold contract.
+def validate_training_input(
+    data: pd.DataFrame, expected_folds: list[tuple[int, int]], aspect_missing: int,
+    fold_column: str = "random_cv_fold", expected_blocks: list[int] | None = None,
+) -> None:
+    """Enforce the approved training population and selected frozen-fold contract.
 
     Args:
         data: Raw training-only dataset.
         expected_folds: Frozen (row, positive) counts in fold-label order.
         aspect_missing: Approved missing count for each aspect feature.
+        fold_column: Saved fold assignment to validate.
+        expected_blocks: Spatial block counts per fold; required for spatial CV.
 
     Raises:
         ValueError: If schema, keys, target, missingness, or fold counts changed.
@@ -318,13 +326,17 @@ def validate_training_input(data: pd.DataFrame, expected_folds: list[tuple[int, 
         raise ValueError(f"Training requires {expected_rows:,} uniquely keyed, nonmissing cell IDs")
     if data.target.value_counts().to_dict() != {0: expected_rows - expected_positives, 1: expected_positives} or data.target.isna().any():
         raise ValueError("Training binary target counts changed")
-    if not pd.api.types.is_integer_dtype(data.random_cv_fold) or data.random_cv_fold.isna().any():
-        raise ValueError("Saved random folds must be nonmissing integers")
-    if set(data.random_cv_fold) != set(range(len(expected_folds))):
-        raise ValueError("Unexpected saved random fold labels")
-    counts = data.groupby("random_cv_fold").target.agg(["size", "sum"])
+    if not pd.api.types.is_integer_dtype(data[fold_column]) or data[fold_column].isna().any():
+        raise ValueError("Saved folds must be nonmissing integers")
+    if set(data[fold_column]) != set(range(len(expected_folds))):
+        raise ValueError("Unexpected saved fold labels")
+    counts = data.groupby(fold_column).target.agg(["size", "sum"])
     if list(counts.itertuples(index=False, name=None)) != expected_folds:
-        raise ValueError(f"Frozen random fold populations changed: {counts}")
+        raise ValueError(f"Frozen fold populations changed: {counts}")
+    if fold_column == "spatial_cv_fold" and expected_blocks is None:
+        raise ValueError("Spatial CV requires expected block counts")
+    if expected_blocks is not None:
+        validate_spatial_block_assignment(data, fold_column, expected_blocks)
     for column in PREDICTORS:
         expected_missing = aspect_missing if column in ASPECT_COLUMNS else 0
         if data[column].isna().sum() != expected_missing:
@@ -338,35 +350,44 @@ def validate_training_input(data: pd.DataFrame, expected_folds: list[tuple[int, 
 def validate_fold_partition(
     data: pd.DataFrame, validation: pd.Series, fold: int,
     expected_folds: list[tuple[int, int]],
+    fold_column: str = "random_cv_fold", expected_blocks: list[int] | None = None,
 ) -> None:
     """Check that one saved validation fold and its complement cover training.
 
     Args:
         data: Validated complete training population.
-        validation: Boolean selection derived directly from saved random folds.
+        validation: Boolean selection derived directly from saved folds.
         fold: Frozen validation label.
         expected_folds: Approved (row, positive) counts for each fold.
+        fold_column: Saved fold assignment to validate.
+        expected_blocks: Optional expected spatial block counts per fold.
 
     Raises:
         ValueError: If membership, counts, classes, or disjointness fail.
     """
-    if not validation.equals(data.random_cv_fold.eq(fold)):
-        raise ValueError("Validation membership differs from saved random folds")
+    if not validation.equals(data[fold_column].eq(fold)):
+        raise ValueError("Validation membership differs from saved folds")
     train = data.loc[~validation]
     held_out = data.loc[validation]
     if len(train) + len(held_out) != len(data) or set(train.cell_id) & set(held_out.cell_id):
         raise ValueError(f"Fold {fold}: train/validation coverage or overlap failure")
     if (len(held_out), int(held_out.target.sum())) != expected_folds[fold]:
         raise ValueError(f"Fold {fold}: validation population differs from saved design")
+    if expected_blocks is not None:
+        if set(train.spatial_block_id) & set(held_out.spatial_block_id):
+            raise ValueError(f"Fold {fold}: a held-out spatial block also appears in training")
+        if held_out.spatial_block_id.nunique() != expected_blocks[fold]:
+            raise ValueError(f"Fold {fold}: spatial block count differs from frozen design")
     if set(train.target) != {0, 1} or set(held_out.target) != {0, 1}:
         raise ValueError(f"Fold {fold}: both classes must occur in each partition")
 
 
-def run_random_cv(
+def run_saved_cv(
     data: pd.DataFrame, features: pd.DataFrame, oof: pd.DataFrame,
     expected_folds: list[tuple[int, int]], pipeline_factory: Callable[[], Pipeline],
+    fold_column: str = "random_cv_fold", expected_blocks: list[int] | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Populate one OOF probability per row using only the saved random labels.
+    """Populate one OOF probability per row using only the selected saved fold labels.
 
     Args:
         data: Validated raw training population.
@@ -374,6 +395,8 @@ def run_random_cv(
         oof: Output storage with an initially missing probability column.
         expected_folds: Approved (row, positive) counts for each fold.
         pipeline_factory: Callable returning a fresh model for every fit.
+        fold_column: Saved random or spatial fold column.
+        expected_blocks: Required per-fold block counts for spatial validation.
 
     Returns:
         Fold metrics and diagnostics; OOF storage is filled in place.
@@ -383,12 +406,16 @@ def run_random_cv(
     """
     if not data.index.is_unique or not features.index.equals(data.index) or not oof.index.equals(data.index):
         raise ValueError("Training, predictors, and OOF storage must have matching unique indices")
+    if fold_column == "spatial_cv_fold" and expected_blocks is None:
+        raise ValueError("Spatial CV requires expected block counts")
+    if expected_blocks is not None:
+        validate_spatial_block_assignment(data, fold_column, expected_blocks)
     assignment_counts = np.zeros(len(data), dtype=np.uint8)
     metrics, diagnostics = [], []
     for fold in range(len(expected_folds)):
-        validation = data.random_cv_fold.eq(fold)
-        validate_fold_partition(data, validation, fold, expected_folds)
-        print(f"Fitting saved random fold {fold}...", flush=True)
+        validation = data[fold_column].eq(fold)
+        validate_fold_partition(data, validation, fold, expected_folds, fold_column, expected_blocks)
+        print(f"Fitting saved {fold_column} fold {fold}...", flush=True)
         probabilities, diagnostic = fit_validation_fold(features, data.target, validation, fold, pipeline_factory)
         oof.loc[validation, "predicted_probability"] = probabilities
         assignment_counts[validation.to_numpy(dtype=bool)] += 1
@@ -396,6 +423,9 @@ def run_random_cv(
         scores = calculate_probability_metrics(labels.to_numpy(), probabilities)
         metrics.append({"fold": fold, "rows": len(labels), "positives": int(labels.sum()),
                         "positive_prevalence": float(labels.mean()), **scores})
+        if expected_blocks is not None:
+            metrics[-1]["blocks"] = int(data.loc[validation, "spatial_block_id"].nunique())
+            diagnostic["spatial_blocks_disjoint"] = True
         diagnostics.append(diagnostic)
         print(f"Fold {fold}: {scores}; runtime={diagnostic['runtime_seconds']} seconds", flush=True)
     if not np.all(assignment_counts == 1):
@@ -403,22 +433,28 @@ def run_random_cv(
     return pd.DataFrame(metrics), diagnostics
 
 
-def validate_oof_predictions(oof: pd.DataFrame, data: pd.DataFrame) -> None:
+def validate_oof_predictions(
+    oof: pd.DataFrame, data: pd.DataFrame, fold_column: str = "random_cv_fold",
+) -> None:
     """Verify complete probability coverage and exact preservation of row identity.
 
     Args:
         oof: Proposed or read-back out-of-fold predictions.
         data: Original training-only data.
+        fold_column: Saved fold column; spatial output also preserves block IDs.
 
     Raises:
         ValueError: If output schema, keys, or probabilities are invalid.
         AssertionError: If target labels or frozen fold membership changed.
     """
-    if list(oof.columns) != ["cell_id", "target", "random_cv_fold", "predicted_probability"] or len(oof) != len(data):
+    identity = ["cell_id", "target"]
+    if fold_column == "spatial_cv_fold":
+        identity.append("spatial_block_id")
+    identity.append(fold_column)
+    if list(oof.columns) != [*identity, "predicted_probability"] or len(oof) != len(data):
         raise ValueError("Unexpected OOF schema or row count")
     if oof.cell_id.isna().any() or oof.cell_id.duplicated().any():
         raise ValueError("OOF keys must be unique and nonmissing")
-    identity = ["cell_id", "target", "random_cv_fold"]
     pd.testing.assert_frame_equal(oof[identity], data[identity], check_exact=True)
     probability = oof.predicted_probability.to_numpy()
     if not np.isfinite(probability).all() or ((probability < 0) | (probability > 1)).any():
@@ -427,6 +463,7 @@ def validate_oof_predictions(oof: pd.DataFrame, data: pd.DataFrame) -> None:
 
 def publish_results(
     oof: pd.DataFrame, folds: pd.DataFrame, summary: dict, data: pd.DataFrame, output_dir: Path,
+    fold_column: str = "random_cv_fold",
 ) -> None:
     """Stage and verify all three outputs before publishing each final file.
 
@@ -436,6 +473,7 @@ def publish_results(
         summary: JSON-compatible summary of the experiment.
         data: Original training rows for read-back validation.
         output_dir: Destination directory for this experiment.
+        fold_column: Saved fold column used for read-back validation.
 
     Raises:
         ValueError: If stored predictions violate their contract.
@@ -450,7 +488,7 @@ def publish_results(
         folds.to_csv(partials[1], index=False)
         partials[2].write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         written = pd.read_parquet(partials[0])
-        validate_oof_predictions(written, data)
+        validate_oof_predictions(written, data, fold_column)
         pd.testing.assert_frame_equal(written, oof, check_exact=True)
         pd.testing.assert_frame_equal(pd.read_csv(partials[1], float_precision="round_trip"), folds, check_exact=True)
         if json.loads(partials[2].read_text(encoding="utf-8")) != summary:
@@ -462,3 +500,30 @@ def publish_results(
     finally:
         for partial in partials:
             partial.unlink(missing_ok=True)
+
+
+def validate_spatial_block_assignment(
+    data: pd.DataFrame, fold_column: str, expected_blocks: list[int],
+) -> None:
+    """Validate saved whole-block membership without rebuilding spatial blocks.
+
+    Args:
+        data: Rows containing saved block IDs and fold assignments.
+        fold_column: Saved spatial fold column.
+        expected_blocks: Frozen block counts in fold-label order.
+
+    Raises:
+        ValueError: If blocks are missing, split across folds, or counts changed.
+    """
+    if data.spatial_block_id.isna().any() or data[fold_column].isna().any():
+        raise ValueError("Spatial block IDs and fold assignments must be nonmissing")
+    block_folds = data.groupby("spatial_block_id")[fold_column].nunique()
+    counts = data.groupby(fold_column).spatial_block_id.nunique()
+    if (len(block_folds) != sum(expected_blocks) or not block_folds.eq(1).all()
+            or counts.index.tolist() != list(range(len(expected_blocks)))
+            or counts.tolist() != expected_blocks):
+        raise ValueError("Saved spatial blocks must belong to one fold and match frozen counts")
+
+
+# Preserve existing callers while sharing the same OOF mechanics across designs.
+run_random_cv = run_saved_cv
