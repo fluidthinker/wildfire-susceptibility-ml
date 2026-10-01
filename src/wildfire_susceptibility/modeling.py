@@ -203,11 +203,17 @@ def build_logistic_pipeline() -> Pipeline:
     return Pipeline([("preprocessing", preprocessing), ("model", model)])
 
 
-def build_random_forest_pipeline() -> Pipeline:
-    """Create an untuned forest with nominal EVT encoding and no numeric scaling.
+def build_random_forest_pipeline(
+    *, max_depth: int | None = None, min_samples_leaf: int = 1,
+) -> Pipeline:
+    """Create a forest with nominal EVT encoding and no numeric scaling.
 
     Undefined flat-terrain aspect is imputed to zero inside each fold. Sparse
     one-hot encoding avoids imposing an ordering on arbitrary EVT codes.
+
+    Args:
+        max_depth: Maximum tree depth; None preserves the unlimited baseline.
+        min_samples_leaf: Minimum leaf population; 1 preserves the baseline.
 
     Returns:
         Fresh preprocessing and 300-tree Random Forest pipeline.
@@ -219,8 +225,8 @@ def build_random_forest_pipeline() -> Pipeline:
     ], remainder="drop", sparse_threshold=1.0)
     model = RandomForestClassifier(
         n_estimators=300, random_state=42, n_jobs=-1, class_weight=None,
-        criterion="gini", max_depth=None, min_samples_split=2,
-        min_samples_leaf=1, max_features="sqrt", bootstrap=True,
+        criterion="gini", max_depth=max_depth, min_samples_split=2,
+        min_samples_leaf=min_samples_leaf, max_features="sqrt", bootstrap=True,
     )
     return Pipeline([("preprocessing", preprocessing), ("model", model)])
 
