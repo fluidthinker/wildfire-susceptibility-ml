@@ -264,7 +264,7 @@ def publish_map(map_object: folium.Map, fingerprints: dict) -> int:
         html = temporary.read_text(encoding="utf-8")
         required = ["data:image/png;base64,", "L.imageOverlay(", "New Mexico boundary",
                     "Eastern geographic holdout", "map-legend", "map-title", CAVEAT,
-                    "L.control.layers(", "openstreetmap.org", "fitBounds("]
+                    "L.control.layers(", "basemap.nationalmap.gov", "fitBounds("]
         if any(token not in html for token in required):
             raise ValueError("Missing required HTML map component")
         if html.count("L.geoJson(") != 2 or "cell_000001" in html:
@@ -307,7 +307,17 @@ def main() -> None:
     )
 
     # STEP 4 - Embed the PNG directly; only the browser requests basemap tiles.
-    map_object = folium.Map(tiles="OpenStreetMap", control_scale=True)
+    map_object = folium.Map(tiles=None, control_scale=True)
+    folium.TileLayer(
+        tiles="https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles courtesy of the U.S. Geological Survey",
+        name="USGS Topo",
+        overlay=False,
+        control=True,
+    ).add_to(map_object)
+
+
+
     folium.raster_layers.ImageOverlay(rgba, bounds=[[south, west], [north, east]],
                                      name=LAYER_NAME, opacity=0.65, origin="upper",
                                      mercator_project=False, pixelated=True).add_to(map_object)
@@ -342,7 +352,7 @@ def main() -> None:
         "display_bins": BINS.tolist(), "state_boundary_source": BOUNDARY_PATH.relative_to(ROOT).as_posix(),
         "holdout_cells": 60_560, "holdout_display_features": len(holdout),
         "holdout_geometry_type": holdout.geometry.iloc[0].geom_type, "outline_simplification_m": 500,
-        "basemap": "OpenStreetMap", "individual_cell_geojson": False,
+        "basemap": "USGS Topo", "individual_cell_geojson": False,
         "outside_state": "transparent at display-pixel centers; source geometry unchanged",
         "output": OUTPUT_PATH.relative_to(ROOT).as_posix(), "html_bytes": size,
         "runtime_seconds": round(perf_counter() - started, 3),
