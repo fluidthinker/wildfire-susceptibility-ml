@@ -307,9 +307,9 @@ def main() -> None:
     )
 
     # STEP 4 - Embed the PNG directly; only the browser requests basemap tiles.
-    map_object = folium.Map(tiles="CartoDB positron", control_scale=True)
+    map_object = folium.Map(tiles="OpenStreetMap", control_scale=True)
     folium.raster_layers.ImageOverlay(rgba, bounds=[[south, west], [north, east]],
-                                     name=LAYER_NAME, opacity=0.8, origin="upper",
+                                     name=LAYER_NAME, opacity=0.65, origin="upper",
                                      mercator_project=False, pixelated=True).add_to(map_object)
 
     # STEP 5 - Add only two small outline features, not 314,920 interactive cells.
