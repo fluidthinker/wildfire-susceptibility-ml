@@ -24,6 +24,7 @@ import pandas as pd
 from rasterio.features import geometry_mask, rasterize
 from rasterio.transform import array_bounds, from_origin, rowcol
 from rasterio.warp import Resampling, calculate_default_transform, reproject, transform_bounds
+from shapely.geometry import box
 
 
 # %% Parameters and paths
@@ -32,6 +33,7 @@ SURFACE_PATH = ROOT / "data/processed/modeling/nm_statewide_susceptibility.geopa
 SUMMARY_PATH = ROOT / "outputs/modeling/statewide_susceptibility/summary.json"
 SPLIT_PATH = ROOT / "data/processed/modeling/nm_modeling_splits.parquet"
 BOUNDARY_PATH = ROOT / "data/processed/boundaries/nm_boundary.gpkg"
+STATES_PATH = ROOT / "data/raw/tiger/tl_2025_us_state.zip"
 OUTPUT_PATH = ROOT / "outputs/maps/nm_wildfire_susceptibility_interactive.html"
 EXPECTED_ROWS = 314_920
 NODATA = -1.0
@@ -45,13 +47,13 @@ CAVEAT = ("Exploratory model output. Geographic transfer to the eastern holdout 
 
 # %% Helper functions
 def fingerprint_inputs() -> dict[str, str]:
-    """Hash the four source artifacts without loading them fully into memory.
+    """Hash source artifacts without loading them fully into memory.
 
     Returns:
         Repository-relative paths and SHA-256 digests.
     """
     result = {}
-    for path in (SURFACE_PATH, SUMMARY_PATH, SPLIT_PATH, BOUNDARY_PATH):
+    for path in (SURFACE_PATH, SUMMARY_PATH, SPLIT_PATH, BOUNDARY_PATH, STATES_PATH):
         with path.open("rb") as source:
             result[path.relative_to(ROOT).as_posix()] = hashlib.file_digest(source, "sha256").hexdigest()
     return result
@@ -208,6 +210,71 @@ def build_holdout_outline(surface: gpd.GeoDataFrame, splits: pd.DataFrame) -> gp
     return gpd.GeoDataFrame({"name": ["Eastern geographic holdout"]}, geometry=[outline], crs=5070).to_crs(4326)
 
 
+def load_neighboring_states(state: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Reuse local TIGER neighbors with the exact same NM boundary provenance.
+
+    Args:
+        state: Existing processed New Mexico boundary.
+
+    Returns:
+        Geographic neighbor polygons without labels or simplified shared edges.
+        Kansas is included only when it intersects the padded NM viewport.
+
+    Raises:
+        FileNotFoundError: If the local nationwide archive is unavailable.
+        ValueError: If the source family or geometry contract differs.
+    """
+    if not STATES_PATH.is_file():
+        raise FileNotFoundError(f"Missing local TIGER state archive: {STATES_PATH}; no download attempted")
+    states = gpd.read_file(STATES_PATH).to_crs(state.crs)
+    original_nm = states.loc[states.STATEFP.eq("35")]
+    if len(original_nm) != 1 or not original_nm.geometry.iloc[0].equals_exact(state.geometry.iloc[0], 0):
+        raise ValueError("Local TIGER New Mexico geometry differs from the processed study boundary")
+    neighbors = states.loc[states.STATEFP.isin(["04", "49", "08", "40", "48", "20"]),
+                           ["STATEFP", "geometry"]].copy()
+    if len(neighbors) != 6 or neighbors.geometry.is_empty.any() or not neighbors.geometry.is_valid.all():
+        raise ValueError("Expected six valid local context states, including optional Kansas")
+    neighbors = neighbors.to_crs(4326)
+    west, south, east, north = state.to_crs(4326).total_bounds
+    viewport = box(west - 0.15, south - 0.15, east + 0.15, north + 0.15)
+    return neighbors.loc[~neighbors.STATEFP.eq("20") | neighbors.intersects(viewport)]
+
+
+def add_quiet_context(map_object: folium.Map, state: gpd.GeoDataFrame,
+                      neighbors: gpd.GeoDataFrame) -> None:
+    """Hide external tile detail with an opaque mask and quiet state polygons.
+
+    Args:
+        map_object: Map retaining USGS Topo beneath the susceptibility image.
+        state: New Mexico boundary in EPSG:4326.
+        neighbors: Unsimplified same-source state polygons in EPSG:4326.
+
+    Raises:
+        ValueError: If the outside mask covers any New Mexico interior area.
+    """
+    # A world-sized mask covers all normal panning, with an exact NM hole.
+    # This is presentation geometry only; no source boundary is modified.
+    outside = box(-180, -85, 180, 85).difference(state.geometry.iloc[0])
+    if not outside.is_valid or outside.intersection(state.geometry.iloc[0]).area > 1e-12:
+        raise ValueError("Outside mask must leave the New Mexico interior uncovered")
+    mask = gpd.GeoDataFrame({"context": ["Outside-NM mask"]}, geometry=[outside], crs=4326)
+    context = neighbors[["geometry"]].assign(context="Neighboring-state context")
+    # Keep context above tiles/image and study outlines above the context.
+    # Noninteractive panes prevent gray polygons from intercepting map input.
+    folium.map.CustomPane("quiet-context", z_index=410).add_to(map_object)
+    folium.map.CustomPane("study-outlines", z_index=430, pointer_events=True).add_to(map_object)
+    folium.GeoJson(mask, name="Outside-NM mask", control=False, pane="quiet-context",
+                   interactive=False,
+                   style_function=lambda _: {"fillColor": "#f0f0f0", "fillOpacity": 1,
+                                              "stroke": False}).add_to(map_object)
+    folium.GeoJson(context, name="Neighboring-state context", control=False,
+                   pane="quiet-context", interactive=False,
+                   style_function=lambda _: {"fillColor": "#f0f0f0", "fillOpacity": 1,
+                                              "color": "#b5b5b5", "weight": 0.8}).add_to(map_object)
+    # No local Mexico polygon is available. The same gray mask supplies
+    # southern context without drawing a competing international border.
+
+
 def add_map_information(map_object: folium.Map) -> None:
     """Add compact interpretation text and exact numeric display-bin labels.
 
@@ -264,11 +331,12 @@ def publish_map(map_object: folium.Map, fingerprints: dict) -> int:
         html = temporary.read_text(encoding="utf-8")
         required = ["data:image/png;base64,", "L.imageOverlay(", "New Mexico boundary",
                     "Eastern geographic holdout", "map-legend", "map-title", CAVEAT,
-                    "L.control.layers(", "basemap.nationalmap.gov", "fitBounds("]
+                    "L.control.layers(", "basemap.nationalmap.gov", "USGSTopo/MapServer/tile/",
+                    "Outside-NM mask", "Neighboring-state context", "quiet-context", "fitBounds("]
         if any(token not in html for token in required):
             raise ValueError("Missing required HTML map component")
-        if html.count("L.geoJson(") != 2 or "cell_000001" in html:
-            raise ValueError("Expected only two outline GeoJSON layers, no cell polygons")
+        if html.count("L.geoJson(") != 4 or "cell_000001" in html:
+            raise ValueError("Expected four context/outline GeoJSON layers, no cell polygons")
         if fingerprint_inputs() != fingerprints:
             raise ValueError("Source artifacts changed while building the presentation")
         temporary.replace(OUTPUT_PATH)
@@ -291,6 +359,7 @@ def main() -> None:
             or state.geometry.isna().any() or state.geometry.is_empty.any()
             or not state.geometry.is_valid.all()):
         raise ValueError("Expected an existing valid New Mexico boundary")
+    neighbors = load_neighboring_states(state)
 
     # STEP 2 - Rasterize the 1-km cells at their exact native resolution.
     source, source_transform = rasterize_surface(surface)
@@ -315,25 +384,23 @@ def main() -> None:
         overlay=False,
         control=True,
     ).add_to(map_object)
-
-
-
     folium.raster_layers.ImageOverlay(rgba, bounds=[[south, west], [north, east]],
                                      name=LAYER_NAME, opacity=0.65, origin="upper",
                                      mercator_project=False, pixelated=True).add_to(map_object)
 
-    # STEP 5 - Add only two small outline features, not 314,920 interactive cells.
+    # STEP 5 - Suppress outside tile detail, then add quiet context and study outlines.
     state_geographic = state[["geometry"]].to_crs(4326)
+    add_quiet_context(map_object, state_geographic, neighbors)
     holdout = build_holdout_outline(surface, pd.read_parquet(SPLIT_PATH))
-    folium.GeoJson(state_geographic, name="New Mexico boundary",
-                   style_function=lambda _: {"color": "#35434b", "weight": 1.2, "fillOpacity": 0},
+    folium.GeoJson(state_geographic, name="New Mexico boundary", pane="study-outlines",
+                   style_function=lambda _: {"color": "#485158", "weight": 1.7, "fillOpacity": 0},
                    tooltip="New Mexico boundary").add_to(map_object)
-    folium.GeoJson(holdout, name="Eastern geographic holdout",
-                   style_function=lambda _: {"color": "#a23a24", "weight": 2.2,
+    folium.GeoJson(holdout, name="Eastern geographic holdout", pane="study-outlines",
+                   style_function=lambda _: {"color": "#996653", "weight": 1.7,
                                               "dashArray": "7 5", "fillOpacity": 0},
                    tooltip="Eastern geographic holdout").add_to(map_object)
     west, south, east, north = state_geographic.total_bounds
-    map_object.fit_bounds([[south, west], [north, east]])
+    map_object.fit_bounds([[south - 0.15, west - 0.15], [north + 0.15, east + 0.15]])
 
     # STEP 6 - Include numeric bins, the evaluation caveat and toggle controls.
     add_map_information(map_object)
@@ -350,10 +417,13 @@ def main() -> None:
         "overlay_bounds_crs": "EPSG:4326", "resampling": "nearest neighbor for both display warps",
         "proj_network": "OFF; use locally available coordinate transformations only",
         "display_bins": BINS.tolist(), "state_boundary_source": BOUNDARY_PATH.relative_to(ROOT).as_posix(),
+        "neighboring_state_source": STATES_PATH.relative_to(ROOT).as_posix(),
+        "neighboring_state_fips": neighbors.STATEFP.tolist(),
+        "mexico_polygon": "Not available locally; neutral outside mask only, no separate border",
         "holdout_cells": 60_560, "holdout_display_features": len(holdout),
         "holdout_geometry_type": holdout.geometry.iloc[0].geom_type, "outline_simplification_m": 500,
         "basemap": "USGS Topo", "individual_cell_geojson": False,
-        "outside_state": "transparent at display-pixel centers; source geometry unchanged",
+        "outside_state": "Opaque #f0f0f0 presentation mask suppresses tiles; susceptibility raster unchanged",
         "output": OUTPUT_PATH.relative_to(ROOT).as_posix(), "html_bytes": size,
         "runtime_seconds": round(perf_counter() - started, 3),
         "modeling_or_performance_analysis": False,
