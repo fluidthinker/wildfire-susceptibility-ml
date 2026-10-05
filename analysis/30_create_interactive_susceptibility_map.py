@@ -392,13 +392,32 @@ def main() -> None:
     state_geographic = state[["geometry"]].to_crs(4326)
     add_quiet_context(map_object, state_geographic, neighbors)
     holdout = build_holdout_outline(surface, pd.read_parquet(SPLIT_PATH))
-    folium.GeoJson(state_geographic, name="New Mexico boundary", pane="study-outlines",
-                   style_function=lambda _: {"color": "#485158", "weight": 1.7, "fillOpacity": 0},
-                   tooltip="New Mexico boundary").add_to(map_object)
-    folium.GeoJson(holdout, name="Eastern geographic holdout", pane="study-outlines",
-                   style_function=lambda _: {"color": "#996653", "weight": 1.7,
-                                              "dashArray": "7 5", "fillOpacity": 0},
-                   tooltip="Eastern geographic holdout").add_to(map_object)
+    folium.GeoJson(state_geographic, 
+                   name="New Mexico boundary", 
+                   pane="study-outlines",
+                   style_function=lambda _: {
+                       "color": "#485158", 
+                       "weight": 1.7, 
+                       "fillOpacity": 0,
+                       "interactive": False,
+                    },
+                  ).add_to(map_object)
+    
+    folium.GeoJson(holdout, 
+                   name="Eastern geographic holdout", 
+                   pane="study-outlines",
+                   style_function=lambda _: {
+                       "color": "#996653", 
+                       "weight": 1.7,
+                       "dashArray": "7 5", 
+                       "fillOpacity": 0,
+                       "interactive": False,
+                    },
+                   ).add_to(map_object)
+
+
+
+    
     west, south, east, north = state_geographic.total_bounds
     map_object.fit_bounds([[south - 0.15, west - 0.15], [north + 0.15, east + 0.15]])
 
