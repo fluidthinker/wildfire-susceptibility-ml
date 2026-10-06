@@ -2,6 +2,9 @@
 
 A reproducible geospatial machine-learning workflow for modeling wildfire susceptibility from environmental characteristics and testing how well those relationships transfer to geographically separate areas.
 
+
+> **Portfolio case study:** [New Mexico Wildfire Susceptibility with Machine Learning](https://fluidthinker.github.io/projects/wildfire-susceptibility/)
+
 The project integrates topography, vegetation, long-term precipitation, and historical wildfire occurrence on a common 1-km grid across New Mexico. Logistic Regression and Random Forest models were evaluated using both conventional random cross-validation and spatial cross-validation, followed by a separate geographic test.
 
 The central finding was that model performance depended strongly on validation design. The baseline Random Forest achieved ROC-AUC 0.956 under random cross-validation and 0.901 under spatial cross-validation, but only 0.541 on the separate geographic test area.
@@ -53,7 +56,8 @@ Because the geographic-test result had already been observed before tuning, the 
 
 ## Validation Performance
 
-![Validation performance across strategies](outputs/figures/wildfire-validation-performance.png)
+
+![Validation performance across strategies](./outputs/figures/wildfire-validation-performance.png)
 
 The chart shows the baseline Random Forest under three increasingly geographically demanding evaluation strategies:
 
