@@ -31,13 +31,26 @@ env/
 !data/interim/.gitkeep
 !data/processed/.gitkeep
 
+
+
+
 # Generated outputs
 /outputs/*
-/outputs/figures/*
-/outputs/maps/*
+
+# Keep final presentation assets
+!/outputs/figures/
+!/outputs/maps/
+!/outputs/figures/*.png
+!/outputs/maps/*.html
+
+# Keep directory placeholders
 !outputs/.gitkeep
 !outputs/figures/.gitkeep
 !outputs/maps/.gitkeep
+
+
+
+
 
 # Large GIS and geospatial artifacts that should not normally be committed
 *.tif
